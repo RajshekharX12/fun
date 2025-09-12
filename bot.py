@@ -41,11 +41,15 @@ from aiogram.exceptions import TelegramBadRequest
 # -----------------------------
 # CONFIG
 # -----------------------------
-BOT_TOKEN = os.getenv("8401266233:AAGkm2s9GOg07Rh8ayZ4PTlc5PRFyh0LzaY", "").strip()
-if not BOT_TOKEN:
-    raise SystemExit("Please set BOT_TOKEN environment variable before running the bot.")
+
+# Hardcoded bot token (as requested)
+BOT_TOKEN = "8401266233:AAGkm2s9GOg07Rh8ayZ4PTlc5PRFyh0LzaY"
 
 DB_PATH = os.getenv("DB_PATH", "tictactoe.db")
+
+# Optional safety check (kept for future edits)
+if not BOT_TOKEN:
+    raise SystemExit("Please set BOT_TOKEN environment variable before running the bot.")
 
 # Difficulty levels
 EASY = "EASY"
