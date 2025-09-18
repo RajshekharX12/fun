@@ -1542,6 +1542,12 @@ async def scheduler_task(bot: Bot):
 async def main():
     await init_db()
     from aiogram.client.default import DefaultBotProperties
+
+    if not BOT_TOKEN:
+        raise RuntimeError("❌ BOT_TOKEN missing in .env")
+    if not OWNER_ID:
+        raise RuntimeError("❌ OWNER_ID missing in .env")
+
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
@@ -1551,5 +1557,6 @@ async def main():
 
     asyncio.create_task(scheduler_task(bot))
 
-    print("Bot started. Owner:", OWNER_ID)
+    logging.info("✅ Bot started. Owner ID: %s", OWNER_ID)
     await dp.start_polling(bot)
+
