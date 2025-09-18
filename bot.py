@@ -1,3 +1,6 @@
+# bot.py — Personal Inbox Bot (Aiogram v3.7+)
+# Copy-paste ready.
+
 import asyncio
 import csv
 import os
@@ -17,117 +20,106 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     Message,
+    FSInputFile,
+    ReactionTypeEmoji,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from dateutil import parser as dtparser
+from aiogram.client.default import DefaultBotProperties
+
 from dotenv import load_dotenv
 
-# ---------- ENV ----------
+# ---------------- ENV / CONFIG ----------------
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-OWNER_ID_STR = os.getenv("OWNER_ID", "").strip()
-try:
-    OWNER_ID = int(OWNER_ID_STR)
-except Exception:
-    OWNER_ID = 0
-
-TZ_LABEL = os.getenv("TZ", "Asia/Kolkata")
-TRANSLATE_ENABLED = os.getenv("TRANSLATE_ENABLED", "false").lower() == "true"
-TRANSLATE_TO = os.getenv("TRANSLATE_TO", "en").strip().lower()
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "20"))
-WHITELIST_MODE = os.getenv("WHITELIST_MODE", "false").lower() == "true"
-AWAY_TEXT = os.getenv("AWAY_TEXT", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+TZ_LABEL = os.getenv("TZ", "Asia/Kolkata").strip()
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "100"))
+WHITELIST_MODE_DEFAULT = os.getenv("WHITELIST_MODE", "false").lower() == "true"
+AWAY_TEXT_DEFAULT = os.getenv("AWAY_TEXT", "").strip()
+ACK_TEXT = os.getenv(
+    "ACK_TEXT",
+    "✅ Your message has been received. I’ll reply as soon as possible."
+).strip()
+DEFAULT_PFP_PATH = os.getenv("DEFAULT_PFP_PATH", "").strip()   # optional jpg/png path
 
 if not BOT_TOKEN or not OWNER_ID:
     raise SystemExit("Please set BOT_TOKEN and OWNER_ID in .env")
 
-# Optional translator (graceful fallback)
-try:
-    from deep_translator import GoogleTranslator  # type: ignore
-
-    _translator_ok = True
-except Exception:
-    _translator_ok = False
-    TRANSLATE_ENABLED = False
-
-# ---------- TIMEZONE ----------
-IST = timezone(timedelta(hours=5, minutes=30))  # Asia/Kolkata fixed offset
-
-# ---------- DB ----------
+# ---------------- TIME / DB ----------------
+IST = timezone(timedelta(hours=5, minutes=30))
 DB_PATH = "inbox.db"
 
-PAGE_SIZE = 8  # users per inbox/contacts page
-CHAT_PAGE_SIZE = 12  # messages per chat screen
+PAGE_SIZE = 8       # users per inbox page
+HIST_PAGE = 12     # history messages per page
 
+# ---------------- STATES ----------------
+class ReplyState(StatesGroup):
+    awaiting = State()
 
+class NoteState(StatesGroup):
+    typing = State()
+
+class TagState(StatesGroup):
+    typing = State()
+
+class AliasState(StatesGroup):
+    typing = State()
+
+class FindState(StatesGroup):
+    typing = State()
+
+# ---------------- ROUTERS ----------------
+admin = Router(name="admin")
+public = Router(name="public")
+cb = Router(name="callbacks")
+home = Router(name="home")
+
+# ---------------- DB INIT / HELPERS ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(
-            """
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
+        await db.executescript("""
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
 
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT,
-                is_whitelisted INTEGER DEFAULT 0,
-                is_blocked INTEGER DEFAULT 0,
-                tags TEXT DEFAULT '',
-                note TEXT DEFAULT '',
-                favorite INTEGER DEFAULT 0,
-                last_seen TIMESTAMP,
-                last_auto_reply_at TIMESTAMP
-            );
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            alias TEXT DEFAULT '',
+            is_whitelisted INTEGER DEFAULT 0,
+            is_blocked INTEGER DEFAULT 0,
+            muted INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '',
+            note TEXT DEFAULT '',
+            favorite INTEGER DEFAULT 0,
+            archived INTEGER DEFAULT 0,
+            priority_pin INTEGER DEFAULT 0,
+            last_seen TIMESTAMP,
+            last_auto_reply_at TIMESTAMP,
+            last_ack_at TIMESTAMP
+        );
 
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                direction TEXT CHECK(direction IN ('in','out')) NOT NULL,
-                content_type TEXT,
-                text TEXT,
-                file_id TEXT,
-                date TIMESTAMP NOT NULL,
-                admin_msg_id INTEGER,
-                is_read INTEGER DEFAULT 0,
-                FOREIGN KEY(user_id) REFERENCES users(user_id)
-            );
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            direction TEXT CHECK(direction IN ('in','out')) NOT NULL,
+            content_type TEXT,
+            text TEXT,
+            file_id TEXT,
+            date TIMESTAMP NOT NULL,
+            admin_msg_id INTEGER,
+            orig_msg_id INTEGER,
+            is_read INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id)
+        );
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS quick_replies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                text TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS triggers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                keyword TEXT NOT NULL,
-                response TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS scheduled_replies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                send_at TIMESTAMP NOT NULL,
-                sent INTEGER DEFAULT 0,
-                FOREIGN KEY(user_id) REFERENCES users(user_id)
-            );
-            """
-        )
-        # --- lightweight migration: add 'archived' column if missing ---
-        async with db.execute("PRAGMA table_info('users')") as cur:
-            cols = [r[1] async for r in cur]
-        if "archived" not in cols:
-            await db.execute("ALTER TABLE users ADD COLUMN archived INTEGER DEFAULT 0")
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """)
         await db.commit()
-
 
 async def set_setting(key: str, value: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -138,53 +130,79 @@ async def set_setting(key: str, value: str):
         )
         await db.commit()
 
-
 async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT value FROM settings WHERE key=?", (key,)) as cur:
             row = await cur.fetchone()
             return row[0] if row else default
 
-
-# ---------- HELPERS ----------
 def is_owner(message: Message) -> bool:
     return message.from_user and message.from_user.id == OWNER_ID
 
-
-async def ensure_user(row_user) -> None:
-    if not row_user:
+async def ensure_user(u) -> None:
+    if not u:
         return
-    uid = row_user.id
-    uname = row_user.username or ""
-    full = (row_user.full_name or "").strip()
-    now_utc = datetime.now(timezone.utc)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO users(user_id, username, full_name, last_seen)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO users(user_id,username,full_name,last_seen)
+            VALUES (?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 full_name=excluded.full_name,
                 last_seen=excluded.last_seen
             """,
-            (uid, uname, full, now_utc),
+            (u.id, u.username or "", (u.full_name or "").strip(), datetime.now(timezone.utc)),
         )
         await db.commit()
 
-
-async def get_user_flags(user_id: int) -> Tuple[bool, bool, bool, bool]:
-    """returns (is_blocked, is_whitelisted, is_favorite, is_archived)"""
+async def get_user_flags(user_id: int) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    """returns (blocked, whitelisted, favorite, archived, muted, priority_pin)"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT is_blocked, is_whitelisted, favorite, archived FROM users WHERE user_id=?",
+            "SELECT is_blocked,is_whitelisted,favorite,archived,muted,priority_pin FROM users WHERE user_id=?",
             (user_id,),
         ) as cur:
             row = await cur.fetchone()
             if not row:
-                return (False, False, False, False)
-            return (bool(row[0]), bool(row[1]), bool(row[2]), bool(row[3]))
+                return False, False, False, False, False, False
+            return tuple(bool(x) for x in row)  # type: ignore
 
+async def save_message(
+    user_id: int,
+    direction: str,
+    content_type: str,
+    text: Optional[str],
+    file_id: Optional[str],
+    admin_msg_id: Optional[int],
+    orig_msg_id: Optional[int],
+    is_read: int,
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO messages(user_id, direction, content_type, text, file_id, date, admin_msg_id, orig_msg_id, is_read)
+            VALUES (?,?,?,?,?,?,?, ?,?)
+            """,
+            (
+                user_id,
+                direction,
+                content_type,
+                text,
+                file_id,
+                datetime.now(timezone.utc),
+                admin_msg_id,
+                orig_msg_id,
+                is_read,
+            ),
+        )
+        await db.commit()
+
+def dt_ist(dt_utc: datetime) -> str:
+    try:
+        return dt_utc.astimezone(IST).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(dt_utc)
 
 async def count_last_min_msgs(user_id: int) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -196,283 +214,201 @@ async def count_last_min_msgs(user_id: int) -> int:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
 
-
-async def save_message(
-    user_id: int,
-    direction: str,
-    content_type: str,
-    text: Optional[str],
-    file_id: Optional[str],
-    admin_msg_id: Optional[int],
-    is_read: int,
-):
-    now_utc = datetime.now(timezone.utc)
+async def mark_all_read(uid: Optional[int] = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO messages(user_id, direction, content_type, text, file_id, date, admin_msg_id, is_read)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, direction, content_type, text, file_id, now_utc, admin_msg_id, is_read),
-        )
+        if uid is None:
+            await db.execute("UPDATE messages SET is_read=1 WHERE direction='in' AND is_read=0")
+        else:
+            await db.execute("UPDATE messages SET is_read=1 WHERE user_id=? AND direction='in' AND is_read=0", (uid,))
         await db.commit()
 
+async def delete_user(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM users WHERE user_id=?", (uid,))
+        await db.commit()
 
-async def admin_msg_map_to_user(admin_msg_id: int) -> Optional[int]:
+async def clear_chat(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM messages WHERE user_id=?", (uid,))
+        await db.commit()
+
+async def export_csv(uid: int, path: str):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT user_id FROM messages WHERE admin_msg_id=? LIMIT 1", (admin_msg_id,)
-        ) as cur:
-            row = await cur.fetchone()
-            return int(row[0]) if row else None
+            "SELECT direction,date,content_type,text,file_id FROM messages WHERE user_id=? ORDER BY date",
+            (uid,),
+        ) as cur, open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["direction", "date(UTC)", "content_type", "text", "file_id"])
+            async for d, dtv, ctype, txt, fid in cur:
+                w.writerow([d, dtv, ctype or "", txt or "", fid or ""])
 
-
-async def mark_read_by_admin_msg(admin_msg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE messages SET is_read=1 WHERE admin_msg_id=?", (admin_msg_id,)
-        )
-        await db.commit()
-
-
-def fmt_user_link(user_id: int, username: Optional[str], full_name: str) -> str:
-    link = f"<a href='tg://user?id={user_id}'>link</a>"
-    u = f"@{username}" if username else "—"
-    full = hesc(full_name or "—")
-    return f"👤 <b>{full}</b> ({u}) • ID: <code>{user_id}</code> • {link}"
-
-
-async def translate_if_enabled(text: str) -> str:
-    if TRANSLATE_ENABLED and _translator_ok and text:
-        try:
-            return GoogleTranslator(source="auto", target=TRANSLATE_TO).translate(text)
-        except Exception:
-            return text
-    return text
-
-
-def kb_admin_for(user_id: int, admin_msg_id: int, blocked: bool, favorite: bool) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="💬 Reply", callback_data=f"act|reply|{admin_msg_id}")
-    b.button(text="⚡ Quick Replies", callback_data=f"act|qr|{admin_msg_id}")
-    b.button(text="ℹ️ Info", callback_data=f"act|info|{admin_msg_id}")
-    b.button(text="📝 Note", callback_data=f"act|note|{user_id}|{admin_msg_id}")
-    b.button(text=("⭐ Unfav" if favorite else "⭐ Fav"), callback_data=f"act|fav|{user_id}|{admin_msg_id}")
-    b.button(text=("✅ Unblock" if blocked else "🚫 Block"), callback_data=f"act|block|{user_id}|{admin_msg_id}")
-    b.button(text="✅ Mark read", callback_data=f"act|read|{admin_msg_id}")
-    b.adjust(2, 2, 3)
-    return b.as_markup()
-
-
-def dt_ist(dt_utc: datetime) -> str:
+async def safe_edit_text(message: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
     try:
-        return dt_utc.astimezone(IST).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return str(dt_utc)
+        await message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        # Ignore "message is not modified"
+        if "message is not modified" in (e.message or "").lower():
+            return
+        raise
 
+def fmt_user_line(name, uname, uid, unread, total, fav, blk, arch, muted, tags) -> str:
+    pfx = []
+    if fav: pfx.append("⭐")
+    if blk: pfx.append("🚫")
+    if muted: pfx.append("🔕")
+    if arch: pfx.append("📦")
+    pfx = "".join(pfx)
+    tgs = f" • 🏷️ {hesc(tags)}" if tags else ""
+    return f"{pfx} <b>{hesc(name or '—')}</b> (@{uname or '—'}) • <code>{uid}</code> • {total} msgs / <b>{unread}</b> unread{tgs}"
 
-# ---------- STATES ----------
-class ReplyState(StatesGroup):
-    awaiting = State()  # waiting for owner to send a message to forward
-
-
-class NoteState(StatesGroup):
-    typing = State()
-
-
-class TagState(StatesGroup):
-    typing = State()
-
-
-# ---------- ROUTERS ----------
-admin = Router(name="admin")
-public = Router(name="public")
-cb = Router(name="callbacks")
-
-
-# ---------- INBOX / CONTACTS HELPERS ----------
-async def fetch_inbox_users(page: int, sort: int, archived: int) -> Tuple[List[Dict], int]:
-    """
-    sort: 0=last, 1=unread, 2=fav
-    archived: 0 or 1
-    returns (rows, total_count)
-    """
-    order_clause = "u.favorite DESC, last_date DESC"
-    if sort == 1:
-        order_clause = "unread DESC, u.favorite DESC, last_date DESC"
-    elif sort == 2:
-        order_clause = "u.favorite DESC, last_date DESC"
+# ---------------- INBOX ----------------
+async def fetch_inbox(page: int, archived: int, sort_key: str) -> Tuple[List[Dict], int]:
+    sort_sql = "last_date DESC"
+    if sort_key == "unread":
+        sort_sql = "unread DESC, last_date DESC"
+    if sort_key == "fav":
+        sort_sql = "favorite DESC, last_date DESC"
 
     offset = page * PAGE_SIZE
     async with aiosqlite.connect(DB_PATH) as db:
-        # Count users that have any message
-        async with db.execute(
-            """
-            SELECT COUNT(*) FROM users u
-            WHERE u.archived=? AND EXISTS (SELECT 1 FROM messages m WHERE m.user_id=u.user_id)
-            """,
-            (archived,),
-        ) as cur:
+        async with db.execute("""
+        SELECT COUNT(*) FROM users u
+        WHERE u.archived=? AND EXISTS (SELECT 1 FROM messages m WHERE m.user_id=u.user_id)
+        """, (archived,)) as cur:
             total = (await cur.fetchone())[0]
 
-        async with db.execute(
-            f"""
-            SELECT
-              u.user_id, u.username, u.full_name, u.tags, u.favorite, u.is_blocked,
-              (SELECT COUNT(*) FROM messages mi WHERE mi.user_id=u.user_id AND mi.direction='in' AND mi.is_read=0) AS unread,
-              (SELECT text FROM messages ml WHERE ml.user_id=u.user_id ORDER BY ml.date DESC LIMIT 1) AS last_text,
-              (SELECT content_type FROM messages ml WHERE ml.user_id=u.user_id ORDER BY ml.date DESC LIMIT 1) AS last_type,
-              (SELECT date FROM messages ml WHERE ml.user_id=u.user_id ORDER BY ml.date DESC LIMIT 1) AS last_date
-            FROM users u
-            WHERE u.archived=?
-              AND EXISTS (SELECT 1 FROM messages mx WHERE mx.user_id=u.user_id)
-            ORDER BY {order_clause}
-            LIMIT ? OFFSET ?
-            """,
-            (archived, PAGE_SIZE, offset),
-        ) as cur:
+        async with db.execute(f"""
+        SELECT
+          u.user_id, u.username, u.full_name, u.alias, u.favorite, u.is_blocked, u.archived, u.muted, u.tags,
+          (SELECT COUNT(*) FROM messages i WHERE i.user_id=u.user_id) AS total_msgs,
+          (SELECT COUNT(*) FROM messages i WHERE i.user_id=u.user_id AND i.direction='in' AND i.is_read=0) AS unread,
+          (SELECT MAX(date) FROM messages i WHERE i.user_id=u.user_id) AS last_date
+        FROM users u
+        WHERE u.archived=?
+          AND EXISTS (SELECT 1 FROM messages mx WHERE mx.user_id=u.user_id)
+        ORDER BY {sort_sql}
+        LIMIT ? OFFSET ?
+        """, (archived, PAGE_SIZE, offset)) as cur:
             rows = []
             async for r in cur:
-                rows.append(
-                    dict(
-                        user_id=r[0],
-                        username=r[1],
-                        full_name=r[2] or "",
-                        tags=r[3] or "",
-                        favorite=bool(r[4]),
-                        blocked=bool(r[5]),
-                        unread=int(r[6] or 0),
-                        last_text=r[7] or "",
-                        last_type=r[8] or "",
-                        last_date=r[9],
-                    )
-                )
+                rows.append(dict(
+                    user_id=r[0], username=r[1], full_name=r[2] or "",
+                    alias=r[3] or "", favorite=bool(r[4]), blocked=bool(r[5]),
+                    archived=bool(r[6]), muted=bool(r[7]), tags=r[8] or "",
+                    total=int(r[9] or 0), unread=int(r[10] or 0), last_date=r[11]
+                ))
     return rows, total
 
-
-def build_inbox_text(rows: List[Dict], page: int, total: int, sort: int, archived: int) -> str:
+def inbox_text(rows: List[Dict], page: int, total: int, archived: int, sort_key: str) -> str:
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    hdr = (
-        f"<b>Inbox{' (archived)' if archived else ''}</b> • Page {page+1}/{total_pages} • Sort: "
-        f"{['Last','Unread','Fav'][sort]}\n"
-    )
+    head = f"<b>{'Archived' if archived else 'Inbox'}</b> • Page {page+1}/{total_pages} • Sort: {hesc(sort_key.capitalize())}\n\n"
     if not rows:
-        return hdr + "\nNo conversations yet."
-    lines = [hdr, ""]
+        return head + "No conversations."
+    lines = [head]
     for r in rows:
-        name = hesc(r["full_name"] or "—")
-        uname = f"@{r['username']}" if r["username"] else "—"
-        tag = f"🏷️ {hesc(r['tags'])}" if r["tags"] else ""
-        fav = "⭐" if r["favorite"] else ""
-        blk = "🚫" if r["blocked"] else ""
-        unread = f"• Unread: <b>{r['unread']}</b>" if r["unread"] else ""
-        last = r["last_text"] or f"[{r['last_type']}]"
-        last = hesc((last or "")[:120])
-        dt = dt_ist(datetime.fromisoformat(r["last_date"])) if r["last_date"] else "—"
-        lines.append(
-            f"{fav}{blk} <b>{name}</b> ({uname}) • ID <code>{r['user_id']}</code>\n"
-            f"  {tag}\n"
-            f"  Last: {last} • {dt} {unread}"
-        )
+        display = r["alias"] or r["full_name"] or r["username"] or str(r["user_id"])
+        lines.append("• " + fmt_user_line(display, r["username"], r["user_id"], r["unread"], r["total"], r["favorite"], r["blocked"], r["archived"], r["muted"], r["tags"]))
     return "\n".join(lines)
 
-
-def kb_inbox(rows: List[Dict], page: int, total: int, sort: int, archived: int) -> InlineKeyboardMarkup:
+def kb_inbox(rows: List[Dict], page: int, total: int, archived: int, sort_key: str) -> InlineKeyboardMarkup:
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     b = InlineKeyboardBuilder()
-    # one "Open" button per row
     for r in rows:
-        label = f"📂 Open: {r['full_name'][:20] or r['username'] or r['user_id']}"
-        b.button(text=label, callback_data=f"chat|{r['user_id']}|0|{sort}|{page}|{archived}")
-    # row: sort + mark all read + prev/next
-    b.button(text="🔁 Sort", callback_data=f"inb|sort|{sort}|{page}|{archived}")
-    b.button(text="✅ Mark all read", callback_data=f"inb|markall|{sort}|{page}|{archived}")
+        label = f"{('⭐ ' if r['favorite'] else '')}{r['alias'] or r['full_name'] or r['username'] or r['user_id']} • {r['total']}/{r['unread']}"
+        b.button(text=label[:64], callback_data=f"chat|{r['user_id']}|{archived}|{sort_key}|{page}")
+    # Controls
+    controls = []
     if page > 0:
-        b.button(text="⏮ Prev", callback_data=f"inb|page|{page-1}|{sort}|{archived}")
+        b.button(text="⏮ Prev", callback_data=f"inb|page|{page-1}|{archived}|{sort_key}")
+        controls.append(1)
     if page < total_pages - 1:
-        b.button(text="⏭ Next", callback_data=f"inb|page|{page+1}|{sort}|{archived}")
+        b.button(text="⏭ Next", callback_data=f"inb|page|{page+1}|{archived}|{sort_key}")
+        controls.append(1)
+    b.button(text=f"🔁 Sort ({sort_key})", callback_data=f"inb|sort|{page}|{archived}|{sort_key}")
+    b.button(text=("📦 Archived" if not archived else "📥 Inbox"), callback_data=f"inb|switch|{page}|{archived}|{sort_key}")
+    b.button(text="✅ Mark all read", callback_data="inb|markall")
     b.adjust(1, 2, 2)
     return b.as_markup()
 
-
-async def fetch_chat_messages(uid: int, offset: int) -> List[Dict]:
+# ---------------- CHAT & HISTORY ----------------
+async def fetch_history(uid: int, offset: int) -> List[Dict]:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT direction, content_type, text, date
-            FROM messages
-            WHERE user_id=?
-            ORDER BY date DESC
-            LIMIT ? OFFSET ?
-            """,
-            (uid, CHAT_PAGE_SIZE, offset),
-        ) as cur:
+        async with db.execute("""
+            SELECT direction, content_type, text, date FROM messages
+            WHERE user_id=? ORDER BY date DESC LIMIT ? OFFSET ?
+        """, (uid, HIST_PAGE, offset)) as cur:
             rows = []
-            async for d, ct, txt, dtv in cur:
-                rows.append(dict(direction=d, content_type=ct or "", text=txt or "", date=dtv))
+            async for d, c, t, dtv in cur:
+                rows.append(dict(direction=d, content_type=c or "", text=t or "", date=dtv))
     return rows
 
-
-def build_chat_text(uid: int, username: str, full_name: str, msgs: List[Dict], offset: int) -> str:
-    head = f"<b>Chat with</b> {hesc(full_name or '—')} (@{username or '—'}) • ID <code>{uid}</code>\n"
+def history_text(uid: int, name: str, uname: str, msgs: List[Dict], offset: int) -> str:
+    head = f"<b>History</b> with <b>{hesc(name)}</b> (@{uname or '—'}) • ID <code>{uid}</code>\n\n"
     if not msgs:
-        return head + "\nNo messages yet."
-    lines = [head, ""]
+        return head + "No messages yet."
+    lines = [head]
     for m in msgs:
         tag = "⬅️ IN" if m["direction"] == "in" else "➡️ OUT"
         body = m["text"] or f"[{m['content_type']}]"
         body = hesc(body[:300])
         dt = dt_ist(datetime.fromisoformat(m["date"]))
         lines.append(f"{tag} • {dt}\n{body}")
-    tail = f"\nPage offset: {offset}"
-    lines.append(tail)
+    lines.append(f"\nPage offset: {offset}")
     return "\n".join(lines)
 
-
-def kb_chat(
-    uid: int, sort: int, page: int, offset: int, is_fav: bool, is_blocked: bool, archived: int
-) -> InlineKeyboardMarkup:
+def kb_history(uid: int, archived: int, sort_key: str, page_back: int, offset: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    # nav
-    prev_off = max(0, offset + CHAT_PAGE_SIZE)
-    next_off = max(0, offset - CHAT_PAGE_SIZE)
-    b.button(text="⏮ Older", callback_data=f"chat|{uid}|{prev_off}|{sort}|{page}|{archived}")
+    prev_off = max(0, offset + HIST_PAGE)
+    next_off = max(0, offset - HIST_PAGE)
+    b.button(text="⏮ Older", callback_data=f"hist|{uid}|{prev_off}|{archived}|{sort_key}|{page_back}")
     if offset > 0:
-        b.button(text="⏭ Newer", callback_data=f"chat|{uid}|{next_off}|{sort}|{page}|{archived}")
-    # actions
-    b.button(text="💬 Reply", callback_data=f"chatreply|{uid}|{sort}|{page}|{offset}|{archived}")
-    b.button(text="✅ Mark all read", callback_data=f"chatmr|{uid}|{sort}|{page}|{offset}|{archived}")
-    b.button(text=("⭐ Unfav" if is_fav else "⭐ Fav"), callback_data=f"chatfav|{uid}|{sort}|{page}|{offset}|{archived}")
-    b.button(
-        text=("✅ Unblock" if is_blocked else "🚫 Block"),
-        callback_data=f"chatblk|{uid}|{sort}|{page}|{offset}|{archived}",
-    )
-    b.button(
-        text=("📦 Unarchive" if archived else "📦 Archive"),
-        callback_data=f"chatarc|{uid}|{sort}|{page}|{offset}|{archived}",
-    )
-    b.button(text="📝 Note", callback_data=f"chatnote|{uid}|{sort}|{page}|{offset}|{archived}")
-    b.button(text="🏷️ Tag", callback_data=f"chattag|{uid}|{sort}|{page}|{offset}|{archived}")
-    # back
-    b.button(text="⬅️ Back to Inbox", callback_data=f"inb|page|{page}|{sort}|{archived}")
-    b.adjust(2, 2, 2, 2, 1)
+        b.button(text="⏭ Newer", callback_data=f"hist|{uid}|{next_off}|{archived}|{sort_key}|{page_back}")
+    b.button(text="⬅️ Back", callback_data=f"chat|{uid}|{archived}|{sort_key}|{page_back}")
+    b.adjust(2,1)
     return b.as_markup()
 
+def kb_chat(uid: int, fav: bool, blk: bool, arch: bool, muted: bool, page_back: int, archived: int, sort_key: str) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="💬 Reply", callback_data=f"chatreply|{uid}")
+    b.button(text="🗂 History", callback_data=f"hist|{uid}|0|{archived}|{sort_key}|{page_back}")
+    b.button(text="✅ Mark read", callback_data=f"chatmr|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text=("⭐ Unfav" if fav else "⭐ Fav"), callback_data=f"chatfav|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text=("🚫 Unblock" if blk else "🚫 Block"), callback_data=f"chatblk|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text=("🔕 Unmute" if muted else "🔕 Mute"), callback_data=f"chatmute|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text=("📦 Unarchive" if arch else "📦 Archive"), callback_data=f"chatarc|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="📝 Note", callback_data=f"chatnote|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="🏷️ Tags", callback_data=f"chattag|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="❤️ React", callback_data=f"react|menu|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="✨ Extras", callback_data=f"extras|menu|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="⬅️ Back to Inbox", callback_data=f"inb|page|{page_back}|{archived}|{sort_key}")
+    b.adjust(2,2,2,2,2,2,1)
+    return b.as_markup()
 
-# ---------- ADMIN COMMANDS ----------
-@admin.message(CommandStart())
-async def owner_start(message: Message):
+def chat_text(uid: int, username: str, name: str) -> str:
+    return f"<b>Chat with</b> {hesc(name)} (@{username or '—'}) • ID <code>{uid}</code>"
+
+# ---------------- START / HELP ----------------
+@home.message(CommandStart())
+async def start(message: Message):
     if not is_owner(message):
         return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Inbox", callback_data="inb|page|0|0|last")
+    kb.button(text="📦 Archived", callback_data="inb|page|0|1|last")
+    kb.button(text="👥 Contacts", callback_data="home|contacts")
+    kb.button(text="❓ Help", callback_data="home|help")
+    kb.adjust(2,2)
     await message.answer(
         "👋 <b>Personal Inbox Bot</b> is up.\n\n"
         "• Full Inbox: /inbox • Archived: /inbox_archived • Sort: /inbox_sort\n"
         "• Open chat: /open &lt;user_id&gt; • Contacts: /contacts [all|whitelist|blocked|favorites]\n"
         "• Mark all read: /mark_all_read\n"
         "Type /help for full commands.",
-        parse_mode=ParseMode.HTML,
+        reply_markup=kb.as_markup(),
+        parse_mode=ParseMode.HTML
     )
-
 
 @admin.message(Command("help"))
 async def owner_help(message: Message):
@@ -480,1258 +416,597 @@ async def owner_help(message: Message):
         return
     await message.answer(
         "<b>Commands</b>\n"
-        "• /inbox – list conversations (paginated)\n"
-        "• /inbox_archived – list archived conversations\n"
-        "• /inbox_sort <last|unread|fav>\n"
-        "• /open <user_id> – open chat view\n"
-        "• /contacts [all|whitelist|blocked|favorites]\n"
-        "• /archive <user_id>, /unarchive <user_id>, /archive_list\n"
-        "• /mark_all_read – mark all inbox as read\n"
-        "• /stats, /settings, /silent <minutes|off>, /away <text|off>\n"
-        "• /whitelist_on, /whitelist_off, /wl_add <user_id>, /wl_del <user_id>\n"
-        "• /block <user_id>, /unblock <user_id>, /fav <user_id>, /unfav <user_id>\n"
-        "• /note_set <user_id> <text>, /note_get <user_id>\n"
-        "• /tag_set <user_id> <tag1,tag2>, /tag_get <user_id>\n"
-        "• /qr_add \"Title\" = \"Text\", /qr_list\n"
-        "• /trigger_add key = response, /trigger_list\n"
-        "• /search <text>, /unread, /export_csv\n"
-        "• /schedule_reply <user_id> <in 10m|YYYY-MM-DD HH:MM> | <text>\n"
-        "• Reply by: button <b>Reply</b> or reply to forwarded message.",
-        parse_mode=ParseMode.HTML,
+        "• /inbox • /inbox_archived • /inbox_sort &lt;last|unread|fav&gt;\n"
+        "• /open &lt;user_id&gt; • /mark_all_read\n"
+        "• /alias &lt;user_id&gt; &lt;name&gt;\n"
+        "• /contacts [all|whitelist|blocked|favorites]\n",
+        parse_mode=ParseMode.HTML
     )
 
-
-@admin.message(Command("settings"))
-async def owner_settings(message: Message):
-    if not is_owner(message):
-        return
-    whitelist_mode = await get_setting("whitelist_mode", "1" if WHITELIST_MODE else "0")
-    silent_until = await get_setting("silent_until", "")
-    t_enabled = "on ✅" if TRANSLATE_ENABLED else "off"
-    away = (await get_setting("away_text", AWAY_TEXT)) or "—"
-    rl = await get_setting("rate_limit_per_min", str(RATE_LIMIT_PER_MIN))
-    inbox_sort = await get_setting("inbox_sort", "last")
-    await message.answer(
-        f"<b>Settings</b>\n"
-        f"• Whitelist mode: {'ON' if whitelist_mode=='1' else 'OFF'}\n"
-        f"• Silent until: {silent_until or '—'}\n"
-        f"• Translate: {t_enabled} → {TRANSLATE_TO}\n"
-        f"• Away text: {away}\n"
-        f"• Rate limit: {rl}/min\n"
-        f"• Inbox sort: {inbox_sort}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@admin.message(Command("stats"))
-async def owner_stats(message: Message):
-    if not is_owner(message):
-        return
-    today_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    week_utc = today_utc - timedelta(days=7)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM messages WHERE direction='in' AND date>=?", (today_utc,)
-        ) as cur:
-            today = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM messages WHERE direction='in' AND date>=?", (week_utc,)
-        ) as cur:
-            week = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT user_id, COUNT(*) AS c FROM messages WHERE direction='in' AND date>=? GROUP BY user_id ORDER BY c DESC LIMIT 5",
-            (week_utc,),
-        ) as cur:
-            rows = await cur.fetchall()
-    top = "\n".join([f"• {uid}: {c}" for uid, c in rows]) or "—"
-    await message.answer(
-        f"<b>Inbox</b>\nToday: <b>{today}</b>\nLast 7 days: <b>{week}</b>\nTop chatters:\n{top}",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@admin.message(Command("silent"))
-async def owner_silent(message: Message):
-    if not is_owner(message):
-        return
-    arg = (message.text or "").split(maxsplit=1)
-    if len(arg) == 1:
-        until = await get_setting("silent_until", "")
-        return await message.answer(f"Silent until: {until or 'OFF'}")
-    v = arg[1].strip().lower()
-    if v == "off":
-        await set_setting("silent_until", "")
-        return await message.answer("🔔 Silent mode OFF")
-    try:
-        minutes = int(v.replace("m", ""))
-        until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
-        await set_setting("silent_until", until)
-        await message.answer(f"🔕 Silent for {minutes} min")
-    except Exception:
-        await message.answer("Usage: /silent <minutes|off>")
-
-
-@admin.message(Command("away"))
-async def owner_away(message: Message):
-    if not is_owner(message):
-        return
-    arg = (message.text or "").split(maxsplit=1)
-    if len(arg) == 1:
-        cur = await get_setting("away_text", AWAY_TEXT or "")
-        return await message.answer(f"Away text: {cur or 'OFF'}")
-    v = arg[1].strip()
-    if v.lower() == "off":
-        await set_setting("away_text", "")
-        return await message.answer("Away OFF")
-    await set_setting("away_text", v)
-    await message.answer("Away text updated.")
-
-
-# ---------- NEW: INBOX / CONTACTS / ARCHIVE ----------
+# ---------------- COMMANDS (OWNER) ----------------
 @admin.message(Command("inbox"))
 async def cmd_inbox(message: Message):
-    if not is_owner(message):
-        return
-    # default sort from settings
-    sort_map = {"last": 0, "unread": 1, "fav": 2}
-    sort_key = await get_setting("inbox_sort", "last")
-    sort = sort_map.get(sort_key, 0)
-    page = 0
-    rows, total = await fetch_inbox_users(page, sort, archived=0)
-    txt = build_inbox_text(rows, page, total, sort, archived=0)
-    await message.answer(
-        txt,
-        reply_markup=kb_inbox(rows, page, total, sort, archived=0),
-        parse_mode=ParseMode.HTML,
-    )
-
+    if not is_owner(message): return
+    rows, total = await fetch_inbox(page=0, archived=0, sort_key="last")
+    await message.answer(inbox_text(rows, 0, total, 0, "last"),
+                         reply_markup=kb_inbox(rows, 0, total, 0, "last"),
+                         parse_mode=ParseMode.HTML)
 
 @admin.message(Command("inbox_archived"))
-async def cmd_inbox_arch(message: Message):
-    if not is_owner(message):
-        return
-    sort_map = {"last": 0, "unread": 1, "fav": 2}
-    sort_key = await get_setting("inbox_sort", "last")
-    sort = sort_map.get(sort_key, 0)
-    page = 0
-    rows, total = await fetch_inbox_users(page, sort, archived=1)
-    txt = build_inbox_text(rows, page, total, sort, archived=1)
-    await message.answer(
-        txt,
-        reply_markup=kb_inbox(rows, page, total, sort, archived=1),
-        parse_mode=ParseMode.HTML,
-    )
-
+async def cmd_inbox_archived(message: Message):
+    if not is_owner(message): return
+    rows, total = await fetch_inbox(page=0, archived=1, sort_key="last")
+    await message.answer(inbox_text(rows, 0, total, 1, "last"),
+                         reply_markup=kb_inbox(rows, 0, total, 1, "last"),
+                         parse_mode=ParseMode.HTML)
 
 @admin.message(Command("inbox_sort"))
 async def cmd_inbox_sort(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /inbox_sort <last|unread|fav>")
-    v = parts[1].lower()
-    if v not in {"last", "unread", "fav"}:
-        return await message.answer("Choose one: last | unread | fav")
-    await set_setting("inbox_sort", v)
-    await message.answer(f"Sort set to: {v}. Use /inbox again.")
-
+    if not is_owner(message): return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or parts[1] not in ("last", "unread", "fav"):
+        return await message.answer("Usage: /inbox_sort &lt;last|unread|fav&gt;", parse_mode=ParseMode.HTML)
+    key = parts[1]
+    rows, total = await fetch_inbox(page=0, archived=0, sort_key=key)
+    await message.answer(inbox_text(rows, 0, total, 0, key),
+                         reply_markup=kb_inbox(rows, 0, total, 0, key),
+                         parse_mode=ParseMode.HTML)
 
 @admin.message(Command("open"))
-async def cmd_open(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /open <user_id>")
+async def cmd_open(message: Message, bot: Bot):
+    if not is_owner(message): return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await message.answer("Usage: /open &lt;user_id&gt;", parse_mode=ParseMode.HTML)
     uid = int(parts[1])
-    # default nav context
-    sort_map = {"last": 0, "unread": 1, "fav": 2}
-    sort_key = await get_setting("inbox_sort", "last")
-    sort = sort_map.get(sort_key, 0)
-    page = 0
-    offset = 0
+    # fetch user
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT username, full_name, favorite, is_blocked, archived FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
     if not row:
         return await message.answer("User not found.")
-    username, full_name, fav, blk, arch = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), int(arch))
-    await message.answer(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
 
-
-@admin.message(Command("contacts"))
-async def cmd_contacts(message: Message):
-    if not is_owner(message):
-        return
-    # filter: all|whitelist|blocked|favorites
-    parts = (message.text or "").split()
-    flt = parts[1].lower() if len(parts) > 1 else "all"
-    where = "1=1"
-    if flt == "whitelist":
-        where = "is_whitelisted=1"
-    elif flt == "blocked":
-        where = "is_blocked=1"
-    elif flt == "favorites":
-        where = "favorite=1"
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            f"SELECT user_id,username,full_name,favorite,is_blocked FROM users WHERE {where} ORDER BY favorite DESC, last_seen DESC LIMIT 50"
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("No contacts found for that filter.")
-    lines = ["<b>Contacts</b> (" + hesc(flt) + ")\n"]
-    b = InlineKeyboardBuilder()
-    for uid, uname, full, fav, blk in rows:
-        lines.append(
-            f"{'⭐' if fav else ''}{'🚫' if blk else ''} <b>{hesc(full or '—')}</b> (@{uname or '—'}) • <code>{uid}</code>"
-        )
-        b.button(text=f"📂 Open {full[:18] or uname or uid}", callback_data=f"chat|{uid}|0|0|0|0")
-    b.adjust(1)
-    await message.answer("\n".join(lines), reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("archive"))
-async def cmd_archive(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /archive <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET archived=1 WHERE user_id=?", (uid,))
-        await db.commit()
-    await message.answer(f"📦 Archived {uid}")
-
-
-@admin.message(Command("unarchive"))
-async def cmd_unarchive(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /unarchive <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET archived=0 WHERE user_id=?", (uid,))
-        await db.commit()
-    await message.answer(f"📦 Unarchived {uid}")
-
-
-@admin.message(Command("archive_list"))
-async def cmd_archive_list(message: Message):
-    if not is_owner(message):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id,username,full_name FROM users WHERE archived=1 ORDER BY last_seen DESC LIMIT 50"
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("No archived chats.")
-    lines = ["<b>Archived Chats</b>\n"]
-    b = InlineKeyboardBuilder()
-    for uid, uname, full in rows:
-        lines.append(f"• {hesc(full or '—')} (@{uname or '—'}) • <code>{uid}</code>")
-        b.button(text=f"📂 Open {full[:18] or uname or uid}", callback_data=f"chat|{uid}|0|0|0|1")
-    b.adjust(1)
-    await message.answer("\n".join(lines), reply_markup=b.as_markup(), parse_mode=ParseMode.HTML)
-
+    # Try to send avatar (fallback to default)
+    sent_photo = False
+    try:
+        photos = await bot.get_user_profile_photos(uid, limit=1)
+        if photos and photos.total_count:
+            fid = photos.photos[0][0].file_id
+            await bot.send_photo(OWNER_ID, fid, caption=chat_text(uid, username, name), reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), 0, int(arch), "last"), parse_mode=ParseMode.HTML)
+            sent_photo = True
+    except Exception:
+        pass
+    if not sent_photo and DEFAULT_PFP_PATH and os.path.exists(DEFAULT_PFP_PATH):
+        await bot.send_photo(OWNER_ID, FSInputFile(DEFAULT_PFP_PATH), caption=chat_text(uid, username, name), reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), 0, int(arch), "last"), parse_mode=ParseMode.HTML)
+    else:
+        if not sent_photo:
+            await message.answer(chat_text(uid, username, name), reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), 0, int(arch), "last"), parse_mode=ParseMode.HTML)
 
 @admin.message(Command("mark_all_read"))
 async def cmd_mark_all_read(message: Message):
-    if not is_owner(message):
-        return
+    if not is_owner(message): return
+    await mark_all_read()
+    await message.answer("✅ Marked all as read.")
+
+@admin.message(Command("alias"))
+async def cmd_alias(message: Message):
+    if not is_owner(message): return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return await message.answer("Usage: /alias &lt;user_id&gt; &lt;new_name&gt;", parse_mode=ParseMode.HTML)
+    uid = int(parts[1]); alias = parts[2].strip()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE messages SET is_read=1 WHERE direction='in' AND is_read=0")
+        await db.execute("UPDATE users SET alias=? WHERE user_id=?", (alias, uid))
         await db.commit()
-    await message.answer("✅ All incoming messages marked as read.")
+    await message.answer("✅ Alias updated.")
 
-
-# ---------- EXISTING ADMIN COMMANDS (whitelist/block/fav/notes/tags/qr/triggers/search/export/schedule) ----------
-@admin.message(Command("whitelist_on"))
-async def wl_on(message: Message):
-    if not is_owner(message):
-        return
-    await set_setting("whitelist_mode", "1")
-    await message.answer("✅ Whitelist mode ON")
-
-
-@admin.message(Command("whitelist_off"))
-async def wl_off(message: Message):
-    if not is_owner(message):
-        return
-    await set_setting("whitelist_mode", "0")
-    await message.answer("❌ Whitelist mode OFF")
-
-
-@admin.message(Command("wl_add"))
-async def wl_add(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /wl_add <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,is_whitelisted) VALUES(?,1) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_whitelisted=1",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"✅ Whitelisted {uid}")
-
-
-@admin.message(Command("wl_del"))
-async def wl_del(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /wl_del <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,is_whitelisted) VALUES(?,0) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_whitelisted=0",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"Removed from whitelist: {uid}")
-
-
-@admin.message(Command("block"))
-async def cmd_block(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /block <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,is_blocked) VALUES(?,1) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_blocked=1",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"🚫 Blocked {uid}")
-
-
-@admin.message(Command("unblock"))
-async def cmd_unblock(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /unblock <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,is_blocked) VALUES(?,0) "
-            "ON CONFLICT(user_id) DO UPDATE SET is_blocked=0",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"Unblocked {uid}")
-
-
-@admin.message(Command("fav"))
-async def cmd_fav(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /fav <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,favorite) VALUES(?,1) "
-            "ON CONFLICT(user_id) DO UPDATE SET favorite=1",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"⭐ Favorited {uid}")
-
-
-@admin.message(Command("unfav"))
-async def cmd_unfav(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /unfav <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,favorite) VALUES(?,0) "
-            "ON CONFLICT(user_id) DO UPDATE SET favorite=0",
-            (uid,),
-        )
-        await db.commit()
-    await message.answer(f"Removed favorite {uid}")
-
-
-@admin.message(Command("note_set"))
-async def note_set(message: Message):
-    if not is_owner(message):
-        return
-    try:
-        _, uid_str, *rest = (message.text or "").split()
-        uid = int(uid_str)
-        note = " ".join(rest).strip()
-    except Exception:
-        return await message.answer("Usage: /note_set <user_id> <text>")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,note) VALUES(?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET note=excluded.note",
-            (uid, note),
-        )
-        await db.commit()
-    await message.answer("📝 Note saved.")
-
-
-@admin.message(Command("note_get"))
-async def note_get(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /note_get <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT note FROM users WHERE user_id=?", (uid,)) as cur:
-            row = await cur.fetchone()
-    await message.answer(f"Note: {hesc(row[0]) if row and row[0] else '—'}", parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("tag_set"))
-async def tag_set(message: Message):
-    if not is_owner(message):
-        return
-    try:
-        _, uid_str, *rest = (message.text or "").split()
-        uid = int(uid_str)
-        tags = " ".join(rest).replace(",", " ").split()
-        tags = ",".join(sorted(set(tags)))
-    except Exception:
-        return await message.answer("Usage: /tag_set <user_id> <tag1,tag2>")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,tags) VALUES(?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET tags=excluded.tags",
-            (uid, tags),
-        )
-        await db.commit()
-    await message.answer(f"🏷️ Tags set: {hesc(tags) or '—'}", parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("tag_get"))
-async def tag_get(message: Message):
-    if not is_owner(message):
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        return await message.answer("Usage: /tag_get <user_id>")
-    uid = int(parts[1])
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT tags FROM users WHERE user_id=?", (uid,)) as cur:
-            row = await cur.fetchone()
-    await message.answer(f"Tags: {hesc(row[0]) if row and row[0] else '—'}", parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("qr_add"))
-async def qr_add(message: Message):
-    if not is_owner(message):
-        return
-    text = (message.text or "").replace("\n", " ").strip()
-    try:
-        payload = text.split(" ", 1)[1]
-        title, body = payload.split("=", 1)
-        title = title.strip().strip('"').strip("'")
-        body = body.strip().strip('"').strip("'")
-    except Exception:
-        return await message.answer('Usage: /qr_add "Title" = "Text"')
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO quick_replies(title,text) VALUES(?,?)", (title, body))
-        await db.commit()
-    await message.answer(f"Added quick reply: <b>{hesc(title)}</b>", parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("qr_list"))
-async def qr_list(message: Message):
-    if not is_owner(message):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id,title FROM quick_replies ORDER BY id ASC") as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("No quick replies yet. Use /qr_add.")
-    lines = [f"{i}. {t}" for i, t in rows]
-    await message.answer("Quick Replies:\n" + "\n".join(lines))
-
-
-@admin.message(Command("trigger_add"))
-async def trigger_add(message: Message):
-    if not is_owner(message):
-        return
-    text = (message.text or "").replace("\n", " ").strip()
-    try:
-        payload = text.split(" ", 1)[1]
-        key, resp = payload.split("=", 1)
-        key = key.strip().lower()
-        resp = resp.strip()
-    except Exception:
-        return await message.answer("Usage: /trigger_add keyword = response")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO triggers(keyword,response) VALUES(?,?)", (key, resp))
-        await db.commit()
-    await message.answer(f"Trigger added for <code>{hesc(key)}</code>", parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("trigger_list"))
-async def trigger_list(message: Message):
-    if not is_owner(message):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id,keyword FROM triggers ORDER BY id ASC") as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("No triggers yet.")
-    await message.answer("Triggers:\n" + "\n".join([f"{i}. {k}" for i, k in rows]))
-
-
-@admin.message(Command("search"))
-async def cmd_search(message: Message):
-    if not is_owner(message):
-        return
-    q = (message.text or "").split(maxsplit=1)
-    if len(q) < 2:
-        return await message.answer("Usage: /search <text>")
-    needle = f"%{q[1].strip()}%"
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id,user_id,direction,substr(text,1,80),date FROM messages "
-            "WHERE text LIKE ? ORDER BY date DESC LIMIT 10",
-            (needle,),
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("No matches.")
-    lines = []
-    for mid, uid, d, t, dtv in rows:
-        lines.append(f"#{mid} • {d} • u{uid} • {dtv} • {t or ''}")
-    await message.answer("Results:\n" + "\n".join(lines))
-
-
-@admin.message(Command("unread"))
-async def cmd_unread(message: Message):
-    if not is_owner(message):
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT m.admin_msg_id, m.user_id, u.username, u.full_name, m.date "
-            "FROM messages m JOIN users u ON u.user_id=m.user_id "
-            "WHERE m.direction='in' AND m.is_read=0 ORDER BY m.date ASC LIMIT 20"
-        ) as cur:
-            rows = await cur.fetchall()
-    if not rows:
-        return await message.answer("🎉 No unread.")
-    text = "\n".join(
-        [f"• {r[4]} | {r[1]} @{r[2] or '-'} ({hesc(r[3] or '-')}) • admin_msg_id={r[0]}" for r in rows]
-    )
-    await message.answer("Unread:\n" + text, parse_mode=ParseMode.HTML)
-
-
-@admin.message(Command("export_csv"))
-async def export_csv(message: Message, bot: Bot):
-    if not is_owner(message):
-        return
-    fn = f"inbox_export_{int(datetime.now().timestamp())}.csv"
-    with open(fn, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [
-                "id",
-                "user_id",
-                "direction",
-                "content_type",
-                "text",
-                "file_id",
-                "date",
-                "admin_msg_id",
-                "is_read",
-            ]
-        )
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT id,user_id,direction,content_type,text,file_id,date,admin_msg_id,is_read FROM messages ORDER BY id ASC"
-            ) as cur:
-                async for row in cur:
-                    writer.writerow(row)
-    await bot.send_document(chat_id=OWNER_ID, document=open(fn, "rb"))
-    os.remove(fn)
-
-
-def parse_schedule_args(text: str) -> Optional[Tuple[int, datetime, str]]:
-    """
-    /schedule_reply <user_id> <in 10m|YYYY-MM-DD HH:MM> | <message>
-    """
-    try:
-        body = text.split(maxsplit=1)[1]
-        part, msg = body.split("|", 1)
-        part = part.strip()
-        msg = msg.strip()
-        uid_str, time_str = part.split(maxsplit=1)
-        uid = int(uid_str)
-        time_str = time_str.strip()
-        if time_str.lower().startswith("in "):
-            amt = time_str[3:].strip()
-            if amt.endswith("m"):
-                delta = timedelta(minutes=int(amt[:-1]))
-            elif amt.endswith("h"):
-                delta = timedelta(hours=int(amt[:-1]))
-            else:
-                delta = timedelta(minutes=int(amt))
-            send_at = datetime.now(timezone.utc) + delta
-        else:
-            dt_local = dtparser.parse(time_str)
-            if dt_local.tzinfo is None:
-                naive = dt_local.replace(tzinfo=IST)
-                send_at = naive.astimezone(timezone.utc)
-            else:
-                send_at = dt_local.astimezone(timezone.utc)
-        return uid, send_at, msg
-    except Exception:
-        return None
-
-
-@admin.message(Command("schedule_reply"))
-async def schedule_reply(message: Message):
-    if not is_owner(message):
-        return
-    parsed = parse_schedule_args(message.text or "")
-    if not parsed:
-        return await message.answer(
-            "Usage:\n/schedule_reply <user_id> <in 10m|YYYY-MM-DD HH:MM> | <message>"
-        )
-    uid, send_at, msg = parsed
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO scheduled_replies(user_id,text,send_at) VALUES(?,?,?)",
-            (uid, msg, send_at),
-        )
-        await db.commit()
-    await message.answer(f"🕒 Scheduled to {uid} at {send_at.isoformat()} (UTC)")
-
-
-# ---------- OWNER SENDS A REPLY (two ways) ----------
-@admin.message(F.reply_to_message)
-async def owner_reply_to_forward(message: Message, bot: Bot):
-    if not is_owner(message):
-        return
-    if not message.reply_to_message:
-        return
-    src_admin_msg_id = message.reply_to_message.message_id
-    target_uid = await admin_msg_map_to_user(src_admin_msg_id)
-    if not target_uid:
-        return await message.answer("Can't map the replied message to a user.")
-    try:
-        await bot.copy_message(
-            chat_id=target_uid, from_chat_id=OWNER_ID, message_id=message.message_id
-        )
-        await save_message(
-            target_uid, "out", message.content_type.name, message.text or "", None, None, 1
-        )
-        await message.answer("✅ Sent.")
-    except TelegramBadRequest as e:
-        await message.answer(f"Failed: {e.message}")
-
-
-# ---------- CALLBACKS (existing 'act|' and new inbox/chat) ----------
-@cb.callback_query(F.data.startswith("act|"))
-async def on_callback(call: CallbackQuery, bot: Bot, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    parts = call.data.split("|")
-    action = parts[1]
-    if action == "reply":
-        admin_msg_id = int(parts[2])
-        target_uid = await admin_msg_map_to_user(admin_msg_id)
-        if not target_uid:
-            return await call.answer("No mapping.", show_alert=True)
-        await state.set_state(ReplyState.awaiting)
-        await state.update_data(target_uid=target_uid)
-        await call.message.answer(
-            f"Reply mode ON → user {target_uid}. Send your message now."
-        )
-        return await call.answer()
-    if action == "qr":
-        admin_msg_id = int(parts[2])
-        target_uid = await admin_msg_map_to_user(admin_msg_id)
-        if not target_uid:
-            return await call.answer("No mapping.", show_alert=True)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT id,title FROM quick_replies ORDER BY id ASC LIMIT 12"
-            ) as cur:
-                rows = await cur.fetchall()
-        if not rows:
-            return await call.answer("No quick replies. Use /qr_add.", show_alert=True)
-        kb = InlineKeyboardBuilder()
-        for rid, title in rows:
-            kb.button(text=title, callback_data=f"act|sendqr|{target_uid}|{rid}")
-        kb.adjust(2)
-        await call.message.answer(
-            "Choose a quick reply:", reply_markup=kb.as_markup()
-        )
-        return await call.answer()
-    if action == "sendqr":
-        target_uid = int(parts[2])
-        qr_id = int(parts[3])
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT text FROM quick_replies WHERE id=?", (qr_id,)
-            ) as cur:
-                row = await cur.fetchone()
-        if not row:
-            return await call.answer("QR missing.")
-        text = row[0]
-        await bot.send_message(chat_id=target_uid, text=text)
-        await save_message(target_uid, "out", "text", text, None, None, 1)
-        await call.answer("Sent.")
-        return
-    if action == "info":
-        admin_msg_id = int(parts[2])
-        uid = await admin_msg_map_to_user(admin_msg_id)
-        if not uid:
-            return await call.answer("No mapping.")
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                "SELECT username,full_name,is_whitelisted,is_blocked,favorite,tags,note FROM users WHERE user_id=?",
-                (uid,),
-            ) as cur:
-                row = await cur.fetchone()
-        username, full_name, wl, bl, fav, tags, note = row or ("", "", 0, 0, 0, "", "")
-        await call.message.answer(
-            f"{fmt_user_link(uid, username, full_name)}\n"
-            f"Whitelist: {bool(wl)} | Blocked: {bool(bl)} | Fav: {bool(fav)}\n"
-            f"Tags: {hesc(tags) or '—'}\nNote: {hesc(note) or '—'}",
-            parse_mode=ParseMode.HTML,
-        )
-        return await call.answer()
-    if action == "note":
-        uid = int(parts[2])
-        await state.set_state(NoteState.typing)
-        await state.update_data(note_uid=uid)
-        await call.message.answer(f"Send note text for {uid}:")
-        return await call.answer()
-    if action == "fav":
-        uid = int(parts[2])
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET favorite=CASE WHEN favorite=1 THEN 0 ELSE 1 END WHERE user_id=?",
-                (uid,),
-            )
-            await db.commit()
-        await call.answer("Toggled favorite.")
-        return
-    if action == "block":
-        uid = int(parts[2])
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET is_blocked=CASE WHEN is_blocked=1 THEN 0 ELSE 1 END WHERE user_id=?",
-                (uid,),
-            )
-            await db.commit()
-        await call.answer("Toggled block.")
-        return
-    if action == "read":
-        admin_msg_id = int(parts[2])
-        await mark_read_by_admin_msg(admin_msg_id)
-        await call.answer("Marked read.")
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-
-
-# ---- NEW: Inbox & Chat callbacks ----
+# ---------------- CALLBACKS: INBOX NAV ----------------
 @cb.callback_query(F.data.startswith("inb|"))
 async def on_inbox_cb(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("Not for you.")
-    _, op, a, b, c = call.data.split("|")
-    if op == "page":
-        page = int(a)
-        sort = int(b)
-        archived = int(c)
-        rows, total = await fetch_inbox_users(page, sort, archived)
-        txt = build_inbox_text(rows, page, total, sort, archived)
-        await call.message.edit_text(
-            txt,
-            reply_markup=kb_inbox(rows, page, total, sort, archived),
-            parse_mode=ParseMode.HTML,
-        )
-        return await call.answer()
-    if op == "sort":
-        old_sort = int(a)
-        page = int(b)
-        archived = int(c)
-        new_sort = (old_sort + 1) % 3
-        rows, total = await fetch_inbox_users(0, new_sort, archived)
-        txt = build_inbox_text(rows, 0, total, new_sort, archived)
-        await call.message.edit_text(
-            txt,
-            reply_markup=kb_inbox(rows, 0, total, new_sort, archived),
-            parse_mode=ParseMode.HTML,
-        )
-        return await call.answer(f"Sort: {['Last','Unread','Fav'][new_sort]}")
-    if op == "markall":
-        sort = int(a)
-        page = int(b)
-        archived = int(c)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE messages SET is_read=1 WHERE direction='in' AND is_read=0"
-            )
-            await db.commit()
-        rows, total = await fetch_inbox_users(page, sort, archived)
-        txt = build_inbox_text(rows, page, total, sort, archived)
-        await call.message.edit_text(
-            txt,
-            reply_markup=kb_inbox(rows, page, total, sort, archived),
-            parse_mode=ParseMode.HTML,
-        )
-        return await call.answer("All marked read.")
+    parts = call.data.split("|")
+    action = parts[1]
+    if action == "markall":
+        await mark_all_read()
+        return await call.answer("Marked all read.")
+    if action == "page":
+        page, archived, sort_key = int(parts[2]), int(parts[3]), parts[4]
+    elif action == "sort":
+        page, archived, sort_key = int(parts[2]), int(parts[3]), parts[4]
+        # rotate sort
+        sort_key = {"last":"unread","unread":"fav","fav":"last"}[sort_key]
+    elif action == "switch":
+        page, archived, sort_key = int(parts[2]), int(parts[3]), parts[4]
+        archived = 0 if archived else 1
+    else:
+        return
 
+    rows, total = await fetch_inbox(page=page, archived=archived, sort_key=sort_key)
+    await safe_edit_text(
+        call.message,
+        inbox_text(rows, page, total, archived, sort_key),
+        reply_markup=kb_inbox(rows, page, total, archived, sort_key)
+    )
+    await call.answer()
 
+# ---------------- CALLBACKS: CHAT PANEL ----------------
 @cb.callback_query(F.data.startswith("chat|"))
-async def on_chat_open(call: CallbackQuery):
+async def open_chat(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
         return await call.answer("Not for you.")
-    # chat|uid|offset|sort|page|archived
-    _, uid_s, off_s, sort_s, page_s, arch_s = call.data.split("|")
-    uid = int(uid_s)
-    offset = int(off_s)
-    sort = int(sort_s)
-    page = int(page_s)
-    archived = int(arch_s)
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    uid = int(uid); archived = int(archived); page_back = int(page_back)
+
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT username, full_name, favorite, is_blocked FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
     if not row:
         return await call.answer("User not found.", show_alert=True)
-    username, full_name, fav, blk = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), archived)
-    await call.message.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    return await call.answer()
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
 
-
-@cb.callback_query(F.data.startswith("chatreply|"))
-async def on_chatreply(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, *_ = call.data.split("|")
-    uid = int(uid_s)
-    await state.set_state(ReplyState.awaiting)
-    await state.update_data(target_uid=uid)
-    await call.message.answer(
-        f"Reply mode ON → user {uid}. Send your message now. (/cancel to stop)"
+    await safe_edit_text(
+        call.message,
+        chat_text(uid, username, name),
+        reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), page_back, archived, sort_key)
     )
-    return await call.answer()
-
+    await call.answer()
 
 @cb.callback_query(F.data.startswith("chatmr|"))
-async def on_chat_markread(call: CallbackQuery):
+async def chat_mark_read(call: CallbackQuery):
     if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, sort_s, page_s, off_s, arch_s = call.data.split("|")
-    uid = int(uid_s)
-    sort = int(sort_s)
-    page = int(page_s)
-    offset = int(off_s)
-    archived = int(arch_s)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE messages SET is_read=1 WHERE user_id=? AND direction='in' AND is_read=0",
-            (uid,),
-        )
-        await db.commit()
-        async with db.execute(
-            "SELECT username,full_name,favorite,is_blocked FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
-            row = await cur.fetchone()
-    username, full_name, fav, blk = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), archived)
-    await call.message.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    return await call.answer("Marked all read.")
-
+        return await call.answer()
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    await mark_all_read(int(uid))
+    await call.answer("Marked as read.")
 
 @cb.callback_query(F.data.startswith("chatfav|"))
-async def on_chat_fav(call: CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, sort_s, page_s, off_s, arch_s = call.data.split("|")
-    uid = int(uid_s)
-    sort = int(sort_s)
-    page = int(page_s)
-    offset = int(off_s)
-    archived = int(arch_s)
+async def chat_fav(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET favorite=CASE WHEN favorite=1 THEN 0 ELSE 1 END WHERE user_id=?",
-            (uid,),
-        )
+        await db.execute("UPDATE users SET favorite = 1 - favorite WHERE user_id=?", (uid,))
         await db.commit()
-        async with db.execute(
-            "SELECT username,full_name,favorite,is_blocked FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
-    username, full_name, fav, blk = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), archived)
-    await call.message.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    return await call.answer("Toggled favorite.")
-
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
+    await safe_edit_text(call.message, chat_text(uid, username, name),
+                         reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), page_back, archived, sort_key))
+    await call.answer("Updated.")
 
 @cb.callback_query(F.data.startswith("chatblk|"))
-async def on_chat_block(call: CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, sort_s, page_s, off_s, arch_s = call.data.split("|")
-    uid = int(uid_s)
-    sort = int(sort_s)
-    page = int(page_s)
-    offset = int(off_s)
-    archived = int(arch_s)
+async def chat_block(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_blocked=CASE WHEN is_blocked=1 THEN 0 ELSE 1 END WHERE user_id=?",
-            (uid,),
-        )
+        await db.execute("UPDATE users SET is_blocked = 1 - is_blocked WHERE user_id=?", (uid,))
         await db.commit()
-        async with db.execute(
-            "SELECT username,full_name,favorite,is_blocked FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
-    username, full_name, fav, blk = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), archived)
-    await call.message.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    return await call.answer("Toggled block.")
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
+    await safe_edit_text(call.message, chat_text(uid, username, name),
+                         reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), page_back, archived, sort_key))
+    await call.answer("Updated.")
 
+@cb.callback_query(F.data.startswith("chatmute|"))
+async def chat_mute(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET muted = 1 - muted WHERE user_id=?", (uid,))
+        await db.commit()
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
+    await safe_edit_text(call.message, chat_text(uid, username, name),
+                         reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), page_back, archived, sort_key))
+    await call.answer("Updated.")
 
 @cb.callback_query(F.data.startswith("chatarc|"))
-async def on_chat_archive(call: CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, sort_s, page_s, off_s, arch_s = call.data.split("|")
-    uid = int(uid_s)
-    sort = int(sort_s)
-    page = int(page_s)
-    offset = int(off_s)
-    archived = int(arch_s)
-    new_arch = 0 if archived else 1
+async def chat_archive(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET archived=? WHERE user_id=?", (new_arch, uid))
+        await db.execute("UPDATE users SET archived = 1 - archived WHERE user_id=?", (uid,))
         await db.commit()
-        async with db.execute(
-            "SELECT username,full_name,favorite,is_blocked FROM users WHERE user_id=?",
-            (uid,),
-        ) as cur:
+        async with db.execute("SELECT username,full_name,alias,favorite,is_blocked,archived,muted FROM users WHERE user_id=?", (uid,)) as cur:
             row = await cur.fetchone()
-    username, full_name, fav, blk = row
-    msgs = await fetch_chat_messages(uid, offset)
-    txt = build_chat_text(uid, username or "", full_name or "", msgs, offset)
-    kb = kb_chat(uid, sort, page, offset, bool(fav), bool(blk), new_arch)
-    await call.message.edit_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-    return await call.answer("Archived." if new_arch else "Unarchived.")
+    username, full_name, alias, fav, blk, arch, muted = row
+    name = alias or full_name or username or str(uid)
+    await safe_edit_text(call.message, chat_text(uid, username, name),
+                         reply_markup=kb_chat(uid, bool(fav), bool(blk), bool(arch), bool(muted), page_back, archived, sort_key))
+    await call.answer("Updated.")
 
-
+# Note / Tag editors
 @cb.callback_query(F.data.startswith("chatnote|"))
-async def on_chat_note(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, *_ = call.data.split("|")
-    uid = int(uid_s)
+async def chat_note_begin(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
     await state.set_state(NoteState.typing)
-    await state.update_data(note_uid=uid)
-    await call.message.answer(f"Send note text for {uid}:")
-    return await call.answer()
+    await state.update_data(uid=int(uid))
+    await call.message.answer("📝 Send note text (or /cancel).")
 
+@admin.message(NoteState.typing)
+async def chat_note_save(message: Message, state: FSMContext):
+    if not is_owner(message): return
+    data = await state.get_data()
+    uid = data.get("uid")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET note=? WHERE user_id=?", (message.text or "", uid))
+        await db.commit()
+    await state.clear()
+    await message.answer("✅ Note saved.")
 
 @cb.callback_query(F.data.startswith("chattag|"))
-async def on_chat_tag(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id != OWNER_ID:
-        return await call.answer("Not for you.")
-    _, uid_s, *_ = call.data.split("|")
-    uid = int(uid_s)
+async def chat_tag_begin(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, archived, sort_key, page_back = call.data.split("|")
     await state.set_state(TagState.typing)
-    await state.update_data(tag_uid=uid)
-    await call.message.answer("Send tags for {uid} (space/comma separated):")
-    return await call.answer()
-
+    await state.update_data(uid=int(uid))
+    await call.message.answer("🏷️ Send tags (comma separated).")
 
 @admin.message(TagState.typing)
-async def tag_state_set(message: Message, state: FSMContext):
+async def chat_tag_save(message: Message, state: FSMContext):
+    if not is_owner(message): return
     data = await state.get_data()
-    uid = data.get("tag_uid")
-    if not uid:
-        await state.clear()
-        return await message.answer("No target.")
-    tags = " ".join((message.text or "").replace(",", " ").split())
-    tags = ",".join(sorted(set(tags.split()))) if tags else ""
+    uid = data.get("uid")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO users(user_id,tags) VALUES(?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET tags=excluded.tags",
-            (uid, tags),
-        )
+        await db.execute("UPDATE users SET tags=? WHERE user_id=?", (message.text or "", uid))
         await db.commit()
     await state.clear()
-    await message.answer(f"🏷️ Tags set: {hesc(tags) or '—'}", parse_mode=ParseMode.HTML)
+    await message.answer("✅ Tags saved.")
 
+# Reply
+@cb.callback_query(F.data.startswith("chatreply|"))
+async def chat_reply_begin(call: CallbackQuery, state: FSMContext):
+    if call.from_user.id != OWNER_ID: return
+    _, uid = call.data.split("|")
+    await state.set_state(ReplyState.awaiting)
+    await state.update_data(uid=int(uid))
+    await call.message.answer("💬 Send your reply (text). /cancel to stop.")
 
-# ---------- OWNER REPLY MODE (via button) ----------
 @admin.message(ReplyState.awaiting)
-async def owner_reply_mode(message: Message, state: FSMContext, bot: Bot):
+async def chat_reply_send(message: Message, state: FSMContext, bot: Bot):
+    if not is_owner(message): return
     data = await state.get_data()
-    target_uid = data.get("target_uid")
-    if not target_uid:
-        await state.clear()
-        return await message.answer("No target.")
-    try:
-        await bot.copy_message(
-            chat_id=target_uid, from_chat_id=OWNER_ID, message_id=message.message_id
-        )
-        await save_message(
-            target_uid, "out", message.content_type.name, message.text or "", None, None, 1
-        )
-        await message.answer("✅ Sent. (Reply mode still ON, /cancel to stop)")
-    except TelegramBadRequest as e:
-        await message.answer(f"Failed: {e.message}")
-
-
-@admin.message(Command("cancel"))
-async def cancel_states(message: Message, state: FSMContext):
-    if not is_owner(message):
-        return
+    uid = int(data["uid"])
+    txt = message.text or ""
+    # send to user
+    sent = await bot.send_message(uid, txt)
+    await save_message(uid, "out", "text", txt, None, message.message_id, sent.message_id, 1)
     await state.clear()
-    await message.answer("Cancelled.")
+    await message.answer("✅ Sent.")
 
+# History
+@cb.callback_query(F.data.startswith("hist|"))
+async def open_history(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid, offset, archived, sort_key, page_back = call.data.split("|")
+    uid = int(uid); offset=int(offset); archived=int(archived); page_back=int(page_back)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT username,full_name,alias FROM users WHERE user_id=?", (uid,)) as cur:
+            row = await cur.fetchone()
+    uname, fulln, alias = row if row else ("", "", "")
+    name = alias or fulln or uname or str(uid)
+    msgs = await fetch_history(uid, offset)
+    await safe_edit_text(
+        call.message,
+        history_text(uid, name, uname, msgs, offset),
+        reply_markup=kb_history(uid, archived, sort_key, page_back, offset)
+    )
+    await call.answer()
 
-# ---------- PUBLIC HANDLERS ----------
-@public.message(F.chat.type == ChatType.PRIVATE)
-async def on_private_user_msg(message: Message, bot: Bot):
-    if message.from_user.id == OWNER_ID:
-        return
-    await ensure_user(message.from_user)
-    uid = message.from_user.id
-    username = message.from_user.username
-    full = message.from_user.full_name or ""
+# Reactions
+def kb_react(uid:int, archived:int, sort_key:str, page_back:int) -> InlineKeyboardMarkup:
+    b=InlineKeyboardBuilder()
+    for emo in ["👍","❤️","🔥","😄","🙏"]:
+        b.button(text=emo, callback_data=f"react|set|{uid}|{emo}|{archived}|{sort_key}|{page_back}")
+    b.button(text="⬅️ Back", callback_data=f"chat|{uid}|{archived}|{sort_key}|{page_back}")
+    b.adjust(5,1)
+    return b.as_markup()
 
-    # Flags & settings
-    is_blocked, is_whitelisted, is_fav, _ = await get_user_flags(uid)
-    if is_blocked:
-        return  # ignore silently
+@cb.callback_query(F.data.startswith("react|menu|"))
+async def react_menu(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _,__, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
+    await safe_edit_text(call.message, "Choose a reaction:", reply_markup=kb_react(uid, archived, sort_key, page_back))
+    await call.answer()
 
-    whitelist_mode = (
-        await get_setting("whitelist_mode", "1" if WHITELIST_MODE else "0")
-    ) == "1"
-    if whitelist_mode and not is_whitelisted:
+@cb.callback_query(F.data.startswith("react|set|"))
+async def react_set(call: CallbackQuery, bot: Bot):
+    if call.from_user.id != OWNER_ID: return
+    _,__, uid, emoji, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid)
+    # last incoming message id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT orig_msg_id FROM messages WHERE user_id=? AND direction='in' AND orig_msg_id IS NOT NULL ORDER BY date DESC LIMIT 1",
+            (uid,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row or not row[0]:
+        return await call.answer("No message to react to.", show_alert=True)
+    try:
+        await bot.set_message_reaction(chat_id=uid, message_id=int(row[0]), reaction=[ReactionTypeEmoji(emoji=emoji)], is_big=False)
+        await call.answer("Reacted.")
+    except Exception:
+        await call.answer("Reaction failed.", show_alert=True)
+
+# Extras menu
+def kb_extras(uid:int, archived:int, sort_key:str, page_back:int) -> InlineKeyboardMarkup:
+    b=InlineKeyboardBuilder()
+    b.button(text="🔄 Refresh avatar", callback_data=f"x|avatar|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="✏️ Set alias", callback_data=f"x|alias|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="🗑 Clear chat", callback_data=f"x|clear|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="❌ Delete user", callback_data=f"x|delete|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="📤 Export CSV", callback_data=f"x|export|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="📌 Toggle priority", callback_data=f"x|prio|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="🖼 Media gallery", callback_data=f"x|media|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="🔎 Find in chat", callback_data=f"x|find|{uid}|{archived}|{sort_key}|{page_back}")
+    b.button(text="⬅️ Back", callback_data=f"chat|{uid}|{archived}|{sort_key}|{page_back}")
+    b.adjust(2,2,2,2,1)
+    return b.as_markup()
+
+@cb.callback_query(F.data.startswith("extras|menu|"))
+async def extras_menu(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _,__, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
+    await safe_edit_text(call.message, "✨ Extras", reply_markup=kb_extras(uid, archived, sort_key, page_back))
+    await call.answer()
+
+@cb.callback_query(F.data.startswith("x|"))
+async def extras_action(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if call.from_user.id != OWNER_ID: return
+    _, act, uid, archived, sort_key, page_back = call.data.split("|")
+    uid=int(uid); archived=int(archived); page_back=int(page_back)
+
+    if act == "avatar":
+        sent = False
         try:
-            await message.answer("Sorry, DMs are currently restricted. (Whitelist mode ON)")
-        except TelegramBadRequest:
-            pass
-        await save_message(
-            uid, "in", message.content_type.name, message.text or "", None, None, 1
-        )
-        return
-
-    # Rate limit
-    if await count_last_min_msgs(uid) >= int(
-        await get_setting("rate_limit_per_min", str(RATE_LIMIT_PER_MIN))
-    ):
-        await message.answer("Please slow down; you're sending messages too quickly.")
-        await save_message(
-            uid, "in", message.content_type.name, message.text or "", None, None, 1
-        )
-        return
-
-    # Triggers
-    if message.text:
-        txt_l = message.text.lower()
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT keyword,response FROM triggers") as cur:
-                trs = await cur.fetchall()
-        for k, resp in trs or []:
-            if k in txt_l:
-                await bot.send_message(chat_id=uid, text=resp)
-                await save_message(uid, "out", "text", resp, None, None, 1)
-
-    # Translation preview (escape text for HTML)
-    preview_text = ""
-    if message.text:
-        orig = hesc(message.text)
-        if TRANSLATE_ENABLED:
-            t = await translate_if_enabled(message.text)
-            t = hesc(t)
-            if t and t != message.text:
-                preview_text = f"{orig}\n\n———\n🌐 Translation → {TRANSLATE_TO}:\n{t}"
-            else:
-                preview_text = orig
-        else:
-            preview_text = orig
-
-    # Silent mode?
-    silent_until_iso = await get_setting("silent_until", "")
-    forward_now = True
-    if silent_until_iso:
-        try:
-            silent_until = datetime.fromisoformat(silent_until_iso)
-            if datetime.now(timezone.utc) < silent_until and not is_fav:
-                forward_now = False
+            photos = await bot.get_user_profile_photos(uid, limit=1)
+            if photos and photos.total_count:
+                fid = photos.photos[0][0].file_id
+                await bot.send_photo(OWNER_ID, fid, caption="Profile photo")
+                sent = True
         except Exception:
-            forward_now = True
-
-    # Forward to OWNER
-    admin_msg_id = None
-    if forward_now:
-        try:
-            sent = await bot.copy_message(
-                chat_id=OWNER_ID, from_chat_id=uid, message_id=message.message_id
-            )
-            admin_msg_id = sent.message_id
-            # attach control kb
-            blocked, _, fav, _ = await get_user_flags(uid)
-            kb = kb_admin_for(uid, admin_msg_id, blocked, fav)
-            info_line = fmt_user_link(uid, username, full)
-            if preview_text:
-                await bot.send_message(
-                    OWNER_ID,
-                    f"{info_line}\n\n{preview_text}",
-                    reply_markup=kb,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                await bot.send_message(
-                    OWNER_ID, info_line, reply_markup=kb, parse_mode=ParseMode.HTML
-                )
-        except TelegramBadRequest as e:
-            await bot.send_message(
-                OWNER_ID, f"⚠️ Failed to copy message from {uid}: {e.message}"
-            )
-
-        await save_message(
-            uid, "in", message.content_type.name, message.text or "", None, admin_msg_id, 0
-        )
-    else:
-        await save_message(
-            uid, "in", message.content_type.name, message.text or "", None, None, 0
-        )
-
-    # Away auto-reply (1x/hour per user)
-    away_text = (await get_setting("away_text", AWAY_TEXT or "")) or ""
-    if away_text:
-        should_send = True
+            pass
+        if not sent and DEFAULT_PFP_PATH and os.path.exists(DEFAULT_PFP_PATH):
+            await bot.send_photo(OWNER_ID, FSInputFile(DEFAULT_PFP_PATH), caption="Default profile photo")
+        return await call.answer("Done.")
+    if act == "alias":
+        await state.set_state(AliasState.typing)
+        await state.update_data(uid=uid)
+        return await call.message.answer("Send new alias for this user.")
+    if act == "clear":
+        await clear_chat(uid)
+        return await call.answer("Chat cleared.")
+    if act == "delete":
+        await delete_user(uid)
+        # go back to inbox
+        rows, total = await fetch_inbox(0, 0, "last")
+        await safe_edit_text(call.message, inbox_text(rows, 0, total, 0, "last"), reply_markup=kb_inbox(rows, 0, total, 0, "last"))
+        return await call.answer("User deleted.")
+    if act == "export":
+        path = f"chat_{uid}.csv"
+        await export_csv(uid, path)
+        if os.path.exists(path):
+            await bot.send_document(OWNER_ID, FSInputFile(path))
+            os.remove(path)
+        return await call.answer("Exported.")
+    if act == "prio":
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET priority_pin = 1 - priority_pin WHERE user_id=?", (uid,))
+            await db.commit()
+        return await call.answer("Priority toggled.")
+    if act == "media":
+        # naive: list last 10 media messages
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT last_auto_reply_at FROM users WHERE user_id=?", (uid,)
+                "SELECT file_id,content_type,date FROM messages WHERE user_id=? AND file_id IS NOT NULL ORDER BY date DESC LIMIT 10",
+                (uid,)
             ) as cur:
+                items = await cur.fetchall()
+        if not items:
+            await call.message.answer("No media found.")
+        else:
+            for fid, ctype, _ in items:
+                try:
+                    if ctype in ("photo","sticker"):
+                        await bot.send_photo(OWNER_ID, fid)
+                    elif ctype in ("video",):
+                        await bot.send_video(OWNER_ID, fid)
+                    else:
+                        await bot.send_document(OWNER_ID, fid)
+                except Exception:
+                    pass
+        return await call.answer()
+    if act == "find":
+        await state.set_state(FindState.typing)
+        await state.update_data(uid=uid)
+        return await call.message.answer("Send a search phrase.")
+
+@admin.message(AliasState.typing)
+async def alias_save(message: Message, state: FSMContext):
+    if not is_owner(message): return
+    data = await state.get_data()
+    uid = data.get("uid")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET alias=? WHERE user_id=?", (message.text or "", uid))
+        await db.commit()
+    await state.clear()
+    await message.answer("✅ Alias updated.")
+
+@admin.message(FindState.typing)
+async def find_in_chat(message: Message, state: FSMContext):
+    if not is_owner(message): return
+    data = await state.get_data()
+    uid = data.get("uid")
+    q = (message.text or "").strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT direction,text,date FROM messages WHERE user_id=? AND text LIKE ? ORDER BY date DESC LIMIT 20",
+            (uid, f"%{q}%"),
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await message.answer("No matches.")
+    else:
+        out = [f"🔎 Results for <b>{hesc(q)}</b>:"]
+        for d, t, dtv in rows:
+            out.append(f"{'⬅️ IN' if d=='in' else '➡️ OUT'} • {dt_ist(datetime.fromisoformat(dtv))}\n{hesc((t or '')[:150])}")
+        await message.answer("\n".join(out), parse_mode=ParseMode.HTML)
+    await state.clear()
+
+# ---------------- PUBLIC: USER MESSAGES ----------------
+@public.message(F.chat.type == ChatType.PRIVATE)
+async def on_user_message(message: Message, bot: Bot):
+    # Save/ensure user
+    await ensure_user(message.from_user)
+
+    uid = message.from_user.id
+    # Check blocked
+    blocked, whitelisted, favorite, archived, muted, prio = await get_user_flags(uid)
+    if blocked:
+        return  # silently ignore
+
+    # Rate limit basic
+    if await count_last_min_msgs(uid) > RATE_LIMIT_PER_MIN:
+        return
+
+    # Persist message
+    text = message.text or message.caption or ""
+    content_type = "text"
+    file_id: Optional[str] = None
+
+    if message.photo:
+        content_type = "photo"; file_id = message.photo[-1].file_id
+    elif message.sticker:
+        content_type = "sticker"; file_id = message.sticker.file_id
+    elif message.video:
+        content_type = "video"; file_id = message.video.file_id
+    elif message.document:
+        content_type = "document"; file_id = message.document.file_id
+    elif message.voice:
+        content_type = "voice"; file_id = message.voice.file_id
+
+    await save_message(uid, "in", content_type, text, file_id, None, message.message_id, 0)
+
+    # Auto-ack once/day
+    ack_ok = True
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_ack_at FROM users WHERE user_id=?", (uid,)) as cur:
                 row = await cur.fetchone()
-        if row and row[0]:
-            try:
-                last = datetime.fromisoformat(row[0])
-                if datetime.now(timezone.utc) - last < timedelta(hours=1):
-                    should_send = False
-            except Exception:
-                pass
-        if should_send:
-            try:
-                await bot.send_message(chat_id=uid, text=away_text)
-                await save_message(uid, "out", "text", away_text, None, None, 1)
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "UPDATE users SET last_auto_reply_at=? WHERE user_id=?",
-                        (datetime.now(timezone.utc).isoformat(), uid),
-                    )
-                    await db.commit()
-            except TelegramBadRequest:
-                pass
-
-
-# ---------- SCHEDULER BACKGROUND TASK ----------
-async def scheduler_task(bot: Bot):
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
+        last_ack = datetime.fromisoformat(row[0]) if row and row[0] else None
+        if last_ack and datetime.now(timezone.utc) - last_ack < timedelta(hours=24):
+            ack_ok = False
+        if ack_ok:
+            await bot.send_message(uid, ACK_TEXT)
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute(
-                    "SELECT id,user_id,text FROM scheduled_replies WHERE sent=0 AND send_at<=?",
-                    (now,),
-                ) as cur:
-                    rows = await cur.fetchall()
-                for rid, uid, text in rows:
-                    try:
-                        await bot.send_message(chat_id=uid, text=text)
-                        await save_message(uid, "out", "text", text, None, None, 1)
-                        await db.execute(
-                            "UPDATE scheduled_replies SET sent=1 WHERE id=?", (rid,)
-                        )
-                        await db.commit()
-                    except TelegramBadRequest:
-                        pass
-        except Exception:
-            pass
-        await asyncio.sleep(30)
+                await db.execute("UPDATE users SET last_ack_at=? WHERE user_id=?", (datetime.now(timezone.utc), uid))
+                await db.commit()
+    except Exception:
+        pass
 
+    # If muted, don't notify owner; still store
+    if muted:
+        return
 
-# ---------- APP ----------
+    # Forward user message to OWNER (copy)
+    try:
+        if content_type == "text":
+            forwarded = await bot.send_message(OWNER_ID, text)
+        elif content_type == "photo":
+            forwarded = await bot.send_photo(OWNER_ID, file_id, caption=text or None)
+        elif content_type == "video":
+            forwarded = await bot.send_video(OWNER_ID, file_id, caption=text or None)
+        elif content_type == "document":
+            forwarded = await bot.send_document(OWNER_ID, file_id, caption=text or None)
+        elif content_type == "sticker":
+            forwarded = await bot.send_sticker(OWNER_ID, file_id)
+        elif content_type == "voice":
+            forwarded = await bot.send_voice(OWNER_ID, file_id, caption=text or None)
+        else:
+            forwarded = await bot.send_message(OWNER_ID, f"[{content_type}]")
+        admin_msg_id = forwarded.message_id
+    except Exception:
+        admin_msg_id = None
+
+    # Save admin mapping
+    await save_message(uid, "in", content_type, text, file_id, admin_msg_id, message.message_id, 0)
+
+    # Send control card WITHOUT repeating the text
+    name = (message.from_user.full_name or "").strip() or message.from_user.username or str(uid)
+    uname = message.from_user.username or ""
+    header = f"👤 <b>{hesc(name)}</b> (@{uname or '—'}) • ID: <code>{uid}</code>"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💬 Reply", callback_data=f"chatreply|{uid}")
+    kb.button(text="⚡ Quick Replies", callback_data=f"chatreply|{uid}")
+    kb.button(text="ℹ️ Info", callback_data=f"openinfo|{uid}")
+    kb.button(text="📝 Note", callback_data=f"chatnote|{uid}|0|last|0")
+    kb.button(text="⭐ Fav", callback_data=f"chatfav|{uid}|0|last|0")
+    kb.button(text="🚫 Block", callback_data=f"chatblk|{uid}|0|last|0")
+    kb.button(text="✅ Mark read", callback_data=f"chatmr|{uid}|0|last|0")
+    kb.adjust(2,2,3)
+    try:
+        await bot.send_message(OWNER_ID, header, reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+# ---------------- MISC ----------------
+@cb.callback_query(F.data.startswith("openinfo|"))
+async def open_info(call: CallbackQuery):
+    if call.from_user.id != OWNER_ID: return
+    _, uid = call.data.split("|")
+    uid = int(uid)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username,full_name,alias,tags,note,favorite,is_blocked,archived,muted FROM users WHERE user_id=?",
+            (uid,)
+        ) as cur:
+            r = await cur.fetchone()
+    if not r:
+        return await call.answer("No info.", show_alert=True)
+    username, full_name, alias, tags, note, fav, blk, arc, mut = r
+    txt = (
+        f"<b>User</b>: {hesc(alias or full_name or username or str(uid))} (@{username or '—'}) • <code>{uid}</code>\n"
+        f"⭐ Fav: {bool(fav)} • 🚫 Blocked: {bool(blk)} • 📦 Archived: {bool(arc)} • 🔕 Muted: {bool(mut)}\n"
+        f"🏷️ Tags: {hesc(tags or '-')}\n"
+        f"📝 Note: {hesc(note or '-')}"
+    )
+    await call.message.answer(txt, parse_mode=ParseMode.HTML)
+    await call.answer()
+
+# ---------------- MAIN ----------------
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     await init_db()
-    from aiogram.client.default import DefaultBotProperties
-
-    if not BOT_TOKEN:
-        raise RuntimeError("❌ BOT_TOKEN missing in .env")
-    if not OWNER_ID:
-        raise RuntimeError("❌ OWNER_ID missing in .env")
 
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
-    dp.include_router(cb)
+    dp.include_router(home)
     dp.include_router(admin)
+    dp.include_router(cb)
     dp.include_router(public)
 
-    asyncio.create_task(scheduler_task(bot))
-
-    logging.info("✅ Bot started. Owner ID: %s", OWNER_ID)
+    print("Bot started. Owner:", OWNER_ID)
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
