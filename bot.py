@@ -438,8 +438,8 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("❎ Reply cancelled.", reply_markup=with_inbox_button(kb, target_page=page))
 
 # ------------------------- Owner Reply ------------------------- #
-@r.message(ReplyFlow.waiting))
-async def owner_send_reply(message: Message, state: FSMContext):  # noqa
+@r.message(ReplyFlow.waiting)
+async def owner_send_reply(message: Message, state: FSMContext):
     if not await is_owner(message.from_user.id):
         return
     data = await state.get_data()
@@ -483,6 +483,7 @@ async def owner_send_reply(message: Message, state: FSMContext):  # noqa
         await message.answer("✅ Sent.", reply_markup=with_inbox_button())
     except Exception as e:
         await message.answer(f"⚠️ Failed to send: <code>{html.escape(repr(e))}</code>", reply_markup=with_inbox_button())
+
 
 # ------------------------- Inbound from users ------------------------- #
 @r.message(F.chat.type == "private")
