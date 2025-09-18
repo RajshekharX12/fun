@@ -1541,7 +1541,8 @@ async def scheduler_task(bot: Bot):
 # ---------- APP ----------
 async def main():
     await init_db()
-    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+    from aiogram.client.default import DefaultBotProperties
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
 
     dp.include_router(cb)
@@ -1552,10 +1553,3 @@ async def main():
 
     print("Bot started. Owner:", OWNER_ID)
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
