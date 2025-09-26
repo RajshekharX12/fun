@@ -5,6 +5,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- Configuration ---
+# Your credentials
 TOKEN = "8287015753:AAEKTs-RERTK869d1gAZ_l2DKdwHJmBJhrM"
 ALLOWED_USER_ID = 7940894807  # Your owner chat ID, used for security
 
@@ -62,8 +63,10 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.message.reply_text("🔎 Gathering system information... please wait a moment.")
 
-    # --- Run Spec Commands ---
+    # --- Run Spec Commands (all arguments use " for Python string) ---
+    
     # OS Information
+    # Using simple cat/grep/awk combo is generally safer than relying on /etc/os-release structure
     os_info = get_spec("cat /etc/os-release 2>/dev/null | grep '^NAME=' | cut -d'\"' -f2")
     
     # CPU and Core Count
@@ -74,9 +77,10 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ram_total = get_spec("free -h | awk '/Mem:/ {print $2}'")
     ram_used = get_spec("free -h | awk '/Mem:/ {print $3}'")
 
-    # Disk
+    # Disk (Fixed by separating the calculation into a new variable)
     disk_total = get_spec("df -h / | awk 'NR==2 {print $2}'")
     disk_used = get_spec("df -h / | awk 'NR==2 {print $3}'")
+    disk_free = get_spec("df -h / | awk 'NR==2 {print $4}'") # New variable for clean f-string insertion
 
     # Uptime
     uptime = get_spec("uptime -p | cut -d' ' -f2-")
@@ -91,10 +95,11 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🧠 **CPU:** {cpu_cores} Cores\n"
         f"  *Model:* {cpu_model}\n\n"
         
-        f"💾 **RAM:** {ram_used} / {ram_total} Used\n\n"
+        f"💾 **RAM:** {ram_used} / {ram_total} Used\n"
+        f"  *Free Space (MB):* {get_spec("free -m | awk '/Mem:/ {print $4}'")}\n\n" # Added RAM free for extra detail
         
         f"💽 **Disk:** {disk_used} / {disk_total} Used\n"
-        f"  *Free Space:* {get_spec("df -h / | awk 'NR==2 {print $4}'")}\n\n"
+        f"  *Free Space:* {disk_free}\n\n" # CORRECTED LINE
         
         f"⏰ **Uptime:** {uptime}"
     )
@@ -112,11 +117,8 @@ def main() -> None:
 
     # Run the bot
     print("Bot is running and listening for commands...")
+    # Use systemd or screen/tmux to keep this running reliably
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    # Ensure subprocess module is available
-    if not os.name == 'posix':
-        print("This script is designed to run on a Linux VPS.")
-    
     main()
