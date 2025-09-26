@@ -17,14 +17,14 @@ logging.basicConfig(
 def get_spec(command, fallback="N/A"):
     """Runs a shell command and returns a clean string, or a fallback value."""
     try:
-        # Simple security check to ensure we only run specific, safe commands
+        # Use shell=True carefully here as commands are predefined and input is restricted
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             check=True,
-            timeout=5 # Add a timeout for safety
+            timeout=5 # Added timeout for safety
         )
         # Use .strip() to remove leading/trailing whitespace/newlines
         return result.stdout.strip()
@@ -36,7 +36,6 @@ async def check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Simple authentication check to restrict commands to the owner."""
     user_id = update.effective_user.id
     if user_id != ALLOWED_USER_ID:
-        # Log and reply if an unauthorized user tries to access
         logging.warning(f"Unauthorized access attempt by user ID: {user_id}")
         await update.message.reply_text("⛔️ **ACCESS DENIED**. This bot is restricted to the owner only.", parse_mode='Markdown')
         return False
@@ -63,10 +62,9 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.message.reply_text("🔎 Gathering system information... please wait a moment.")
 
-    # --- Run Spec Commands (all arguments use " for Python string) ---
+    # --- Run Spec Commands (All definitions are fine) ---
     
     # OS Information
-    # Using simple cat/grep/awk combo is generally safer than relying on /etc/os-release structure
     os_info = get_spec("cat /etc/os-release 2>/dev/null | grep '^NAME=' | cut -d'\"' -f2")
     
     # CPU and Core Count
@@ -77,15 +75,15 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ram_total = get_spec("free -h | awk '/Mem:/ {print $2}'")
     ram_used = get_spec("free -h | awk '/Mem:/ {print $3}'")
 
-    # Disk (Fixed by separating the calculation into a new variable)
+    # Disk
     disk_total = get_spec("df -h / | awk 'NR==2 {print $2}'")
     disk_used = get_spec("df -h / | awk 'NR==2 {print $3}'")
-    disk_free = get_spec("df -h / | awk 'NR==2 {print $4}'") # New variable for clean f-string insertion
+    disk_free = get_spec("df -h / | awk 'NR==2 {print $4}'") 
 
     # Uptime
     uptime = get_spec("uptime -p | cut -d' ' -f2-")
 
-    # --- Create Emoji Breakdown ---
+    # --- Create Emoji Breakdown (FIXED quoting in f-string calls) ---
     specs_message = (
         f"🤖 **VPS Status Report**\n"
         f"─────────────────────\n"
@@ -96,10 +94,11 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"  *Model:* {cpu_model}\n\n"
         
         f"💾 **RAM:** {ram_used} / {ram_total} Used\n"
-        f"  *Free Space (MB):* {get_spec("free -m | awk '/Mem:/ {print $4}'")}\n\n" # Added RAM free for extra detail
+        # This line is FIXED by using single quotes for the argument
+        f"  *Free Space (MB):* {get_spec('free -m | awk \'/Mem:/ {print $4}\'')}\n\n"
         
         f"💽 **Disk:** {disk_used} / {disk_total} Used\n"
-        f"  *Free Space:* {disk_free}\n\n" # CORRECTED LINE
+        f"  *Free Space:* {disk_free}\n\n" 
         
         f"⏰ **Uptime:** {uptime}"
     )
@@ -117,7 +116,6 @@ def main() -> None:
 
     # Run the bot
     print("Bot is running and listening for commands...")
-    # Use systemd or screen/tmux to keep this running reliably
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
