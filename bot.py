@@ -62,10 +62,11 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await update.message.reply_text("🔎 Gathering system information... please wait a moment.")
 
-    # --- Run Spec Commands (All definitions are fine) ---
+    # --- Run Spec Commands (All calls moved to variables for clean f-string use) ---
     
     # OS Information
     os_info = get_spec("cat /etc/os-release 2>/dev/null | grep '^NAME=' | cut -d'\"' -f2")
+    kernel_version = get_spec("uname -r")
     
     # CPU and Core Count
     cpu_model = get_spec("lscpu 2>/dev/null | grep 'Model name' | awk -F': ' '{print $2}' | head -n 1")
@@ -74,31 +75,32 @@ async def specs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Memory
     ram_total = get_spec("free -h | awk '/Mem:/ {print $2}'")
     ram_used = get_spec("free -h | awk '/Mem:/ {print $3}'")
+    # FIX: Get RAM free in MB and assign to a variable
+    ram_free_mb = get_spec("free -m | awk '/Mem:/ {print $4}'") 
 
     # Disk
     disk_total = get_spec("df -h / | awk 'NR==2 {print $2}'")
     disk_used = get_spec("df -h / | awk 'NR==2 {print $3}'")
-    disk_free = get_spec("df -h / | awk 'NR==2 {print $4}'") 
+    disk_free = get_spec("df -h / | awk 'NR==2 {print $4}'")
 
     # Uptime
     uptime = get_spec("uptime -p | cut -d' ' -f2-")
 
-    # --- Create Emoji Breakdown (FIXED quoting in f-string calls) ---
+    # --- Create Emoji Breakdown (All variables are clean and ready) ---
     specs_message = (
         f"🤖 **VPS Status Report**\n"
         f"─────────────────────\n"
         f"🌐 **OS:** {os_info} \n"
-        f"🛠️ **Kernel:** {get_spec('uname -r')}\n\n"
+        f"🛠️ **Kernel:** {kernel_version}\n\n"
         
         f"🧠 **CPU:** {cpu_cores} Cores\n"
         f"  *Model:* {cpu_model}\n\n"
         
         f"💾 **RAM:** {ram_used} / {ram_total} Used\n"
-        # This line is FIXED by using single quotes for the argument
-        f"  *Free Space (MB):* {get_spec('free -m | awk \'/Mem:/ {print $4}\'')}\n\n"
+        f"  *Free Space (MB):* {ram_free_mb}\n\n"
         
         f"💽 **Disk:** {disk_used} / {disk_total} Used\n"
-        f"  *Free Space:* {disk_free}\n\n" 
+        f"  *Free Space:* {disk_free}\n\n"
         
         f"⏰ **Uptime:** {uptime}"
     )
