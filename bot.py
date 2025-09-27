@@ -4,7 +4,7 @@
 # - Human = X, Bot = O (optimal play, cannot be beaten)
 # - Works in private chats; safe in groups (ignores others' taps)
 # - Game state is held in memory (in the Dispatcher's context).
-# - Added attitude and message cleanup removal.
+# - Attitude and clean asynchronous flow implemented.
 
 import asyncio
 import os
@@ -38,17 +38,10 @@ if not BOT_TOKEN:
 # -------------------------------------------------------------------
 
 # Game State structure:
-# gid: unique ID for the game
-# chat_id: chat where the game is played
-# message_id: the message containing the board
-# user_id: the user who started the game (the only one who can play)
-# username: the player's name (for attitude)
-# board: 9 chars: ' ', 'X', 'O'
-# status: 'PLAY', 'XWIN', 'OWIN', 'DRAW'
-Game = Tuple[str, int, int, int, str, str, str] # (gid, chat_id, message_id, user_id, username, board, status)
+# (gid, chat_id, message_id, user_id, username, board, status)
+Game = Tuple[str, int, int, int, str, str, str]
 
 # The memory store for active games: { message_id: Game }
-# This will be stored in dp.workflow_data
 GAME_STATE_KEY = "active_games"
 
 # -------------------------------------------------------------------
@@ -81,7 +74,6 @@ def is_draw(board: str) -> bool:
     """Checks if the game is a draw."""
     return (check_winner(board) is None) and (EMPTY not in board)
 
-# Minimax logic remains the same (it was correct)
 def minimax(board: str, is_max: bool, depth: int = 0) -> int:
     """The Minimax algorithm to determine the optimal score."""
     w = check_winner(board)
@@ -121,8 +113,8 @@ def best_move(board: str) -> int:
             best_score = score
             best_idx = i
             
-    # Should always find a move if not draw/win
     if best_idx == -1:
+        # Should not be reached in a non-finished game
         return empty_cells(board)[0]
     
     return best_idx
@@ -156,15 +148,12 @@ def attitude_message(status: str, username: str) -> str:
     user_name = f"@{username}" if username else "human"
     
     if status == "DRAW":
-        # Attitude: Middle finger, jerk, can't beat me
         return f"🖕 | **{user_name}**, what kind of jerk are you? You can't even beat me... I'm perfect, and you're just... mediocre."
     elif status == "OWIN":
-        # Attitude: Smug victory, total defeat
         return f"👑 | Hah! **{user_name}**, you really thought you could win? I calculate all possibilities. Your total defeat was inevitable. Bow down."
     elif status == "XWIN":
-        # Attitude: Shock, impossible scenario (only happens if minimax is bugged or logic error, but respond anyway)
         return f"🤯 | IMPOSSIBLE! **{user_name}**, this must be a glitch in the Matrix! The universe is broken! I DEMAND A RECOUNT!"
-    else: # Should not happen for a final message
+    else: 
         return "Game is over, stop distracting me with your silly feelings."
 
 
@@ -177,22 +166,18 @@ def render_text(board: str, status: str, username: Optional[str] = None) -> str:
         " ".join(cell_emoji(board[i]) for i in range(6,9)),
     ]
     
-    # Use a generic heading for the board itself
     heading = "<b>Tic-Tac-Toe</b> (You: ❌  |  Bot: ⭕️)"
     board_str = "\n\n<code>" + "\n".join(rows) + "</code>"
     
-    # Determine the status line
     if status == "PLAY":
         is_human = is_human_turn(board)
         if board.count(EMPTY) == 9:
-            status_line = "Your move. Try not to embarrass yourself." # Human starts
+            status_line = "Your move. Try not to embarrass yourself."
         elif is_human:
              status_line = "Your turn. I'm waiting. Tick-tock."
         else:
-             # This is displayed *before* the bot moves, giving the thinking effect
              status_line = "Bot is calculating your inevitable demise..." 
     else:
-        # Game over - use the attitude message
         status_line = attitude_message(status, username)
         
     return heading + "\n\n" + status_line + board_str
@@ -200,7 +185,6 @@ def render_text(board: str, status: str, username: Optional[str] = None) -> str:
 def board_keyboard(gid: str, board: str, status: str) -> InlineKeyboardMarkup:
     """Generates the inline keyboard for the board."""
     kb_rows = []
-    # Can play only if game is PLAYING AND it's the HUMAN's turn
     can_play = status == "PLAY" and is_human_turn(board)
     
     for r in range(3):
@@ -211,19 +195,15 @@ def board_keyboard(gid: str, board: str, status: str) -> InlineKeyboardMarkup:
             text = cell_emoji(ch)
             
             if can_play and ch == EMPTY:
-                # Human's turn and cell is empty -> clickable move button
                 row.append(InlineKeyboardButton(text=text, callback_data=f"mv:{gid}:{idx}"))
             else:
-                # All other states: noop button
                 row.append(InlineKeyboardButton(text=text, callback_data=f"noop:{gid}"))
         kb_rows.append(row)
 
     bottom = []
-    # Only offer "Bot starts" if the board is completely empty AND game is PLAYING
     if status == "PLAY" and board == EMPTY * 9:
         bottom.append(InlineKeyboardButton(text="🤖 Bot starts (I am the master)", callback_data=f"botstart:{gid}"))
         
-    # The 'new' button is always available
     bottom.append(InlineKeyboardButton(text="⚔️ New game (Same result, probably)", callback_data="new"))
     kb_rows.append(bottom)
     
@@ -244,7 +224,6 @@ def set_game(game: Game, workflow_data: Dict[str, Any]):
     if GAME_STATE_KEY not in workflow_data:
         workflow_data[GAME_STATE_KEY] = {}
     
-    # Store by message_id for easy retrieval/update via CallbackQuery
     workflow_data[GAME_STATE_KEY][message_id] = game
 
 def delete_game(message_id: int, workflow_data: Dict[str, Any]):
@@ -268,12 +247,14 @@ async def on_start(m: Message):
         parse_mode=ParseMode.HTML
     )
 
+# FIX: Added workflow_data argument
 @router.message(Command("newgame"))
 async def on_newgame_cmd(m: Message, bot: Bot, workflow_data: Dict[str, Any]):
     """Handles the /newgame command."""
     username = m.from_user.username or m.from_user.first_name
     await start_new_game(m.chat.id, m.from_user.id, username, bot, workflow_data)
 
+# FIX: Added workflow_data argument
 @router.callback_query(F.data == "new")
 async def on_new(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
     """Handles the 'New game' inline button click."""
@@ -288,7 +269,6 @@ async def on_new(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
     
 async def start_new_game(chat_id: int, user_id: int, username: str, bot: Bot, workflow_data: Dict[str, Any]):
     """Starts a new game and sends the initial message."""
-    # Game ID: hex-encoded timestamp for uniqueness
     gid = hex(int(time.time() * 1000))[2:]
     board = EMPTY * 9
     status = "PLAY"
@@ -311,15 +291,15 @@ async def start_new_game(chat_id: int, user_id: int, username: str, bot: Bot, wo
 async def on_bot_start(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
     """Handles the 'Bot starts' button click (initial move O)."""
     await cq.answer()
-    _, gid = cq.data.split(":")
+    # _, gid = cq.data.split(":") # gid is unused, can be removed
     
     if not cq.message: return
 
     game = get_game(cq.message.message_id, workflow_data)
     
-    # CRITICAL: Validate click is from the correct user and game exists
-    if not game or cq.from_user.id != game[3]: # game[3] is user_id
-        if game and cq.from_user.id != game[3]: # Not the player
+    # Validate click is from the correct user and game exists
+    if not game or cq.from_user.id != game[3]:
+        if game and cq.from_user.id != game[3]:
             await cq.answer(f"Hush, {cq.from_user.first_name}. This is not your game! Go start a /newgame.", show_alert=True)
         return
         
@@ -333,16 +313,15 @@ async def on_bot_start(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any
     idx = best_move(board)
     board = board[:idx] + BOT + board[idx+1:]
     
-    # Status should still be PLAY after first move
     status = resolve_status(board)
     
-    # Update game state in memory (turn is implicitly Human's next)
-    set_game((gid, chat_id, message_id, user_id, username, board, status), workflow_data)
+    # Update game state in memory
+    game_after_bot = (gid, chat_id, message_id, user_id, username, board, status)
+    set_game(game_after_bot, workflow_data)
     
-    await edit_board(bot, message_id, game) # Use the latest game state from memory
+    # Pass the updated game state
+    await edit_board(bot, message_id, game_after_bot) 
 
-# CRITICAL FIX: The bot's turn should be executed as a separate, non-blocking task 
-# after the message edit for the human's move is successful.
 @router.callback_query(F.data.startswith("mv:"))
 async def on_move(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
     """Handles a human's move and schedules the bot's counter-move."""
@@ -376,16 +355,13 @@ async def on_move(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
     if status_after_human != "PLAY":
         # Game over after human move (Win or Draw)
         await edit_board(bot, message_id, game_after_human)
-        # Delete game state from memory
         delete_game(message_id, workflow_data)
         return
 
     # --- 2. Update board to 'Bot is thinking...' ---
-    # This gives immediate visual feedback before the bot calculates and moves
     await edit_board(bot, message_id, game_after_human)
 
     # --- 3. Schedule Bot move (O) as a separate task ---
-    # Pass the current (human's) board state and the dispatcher's workflow_data
     asyncio.create_task(
         bot_move_task(bot, message_id, board_after_human, workflow_data)
     )
@@ -396,7 +372,7 @@ async def bot_move_task(bot: Bot, message_id: int, board_before_bot: str, workfl
         # Give a small artificial delay for the 'thinking' effect
         await asyncio.sleep(0.5) 
 
-        # Retrieve the latest game state again in case it was modified (unlikely but safe)
+        # Retrieve the latest game state
         game = get_game(message_id, workflow_data)
         if not game:
             logger.warning(f"Game {message_id} vanished before bot could move.")
@@ -405,11 +381,12 @@ async def bot_move_task(bot: Bot, message_id: int, board_before_bot: str, workfl
         gid, chat_id, message_id, user_id, username, current_board, status = game
 
         # CRITICAL: Only proceed if the board hasn't changed since the human move
+        # This protects against double-taps or concurrency issues
         if current_board != board_before_bot:
-             logger.warning(f"Bot move skipped: Board state changed for game {gid}")
+             logger.warning(f"Bot move skipped: Board state changed unexpectedly for game {gid}")
              return
 
-        # Recalculate best move on the latest board state
+        # Recalculate best move
         bot_idx = best_move(current_board)
         board_after_bot = current_board[:bot_idx] + BOT + current_board[bot_idx+1:]
         status_after_bot = resolve_status(board_after_bot)
@@ -422,26 +399,26 @@ async def bot_move_task(bot: Bot, message_id: int, board_before_bot: str, workfl
         await edit_board(bot, message_id, game_after_bot)
 
         if status_after_bot != "PLAY":
-            # Delete game state from memory after game ends
             delete_game(message_id, workflow_data)
 
     except Exception as e:
         logger.error(f"Bot move task failed for game {message_id}: {e}")
 
+# FIX: Added workflow_data argument for correct dependency injection
 @router.callback_query(F.data.startswith("noop:"))
-async def on_noop(cq: CallbackQuery):
+async def on_noop(cq: CallbackQuery, workflow_data: Dict[str, Any]):
     """Handles clicks on non-action buttons (taken cells, bot's turn, etc.)."""
     
-    # Check if the click is from the player of the game
     if not cq.message: return
-    game = get_game(cq.message.message_id, cq.bot.get_dispatcher().workflow_data)
+    # Retrieve game state using the injected workflow_data
+    game = get_game(cq.message.message_id, workflow_data)
     
     if game and cq.from_user.id != game[3]:
         # User who did not start the game: show an alert
-        await cq.answer(f"Hush, {cq.from_user.first_name}. This is not your game! Go start a /newgame.", show_alert=True)
+        player_name = cq.from_user.first_name
+        await cq.answer(f"Hush, {player_name}. This is not your game! Go start a /newgame.", show_alert=True)
     else:
-        # Player clicked a non-actionable button (e.g., taken cell, bot's turn): answer silently
-        # This prevents the loading spinner from hanging
+        # Player clicked a non-actionable button: answer silently
         await cq.answer()
     
 # -------------------------------------------------------------------
@@ -463,13 +440,15 @@ async def edit_board(bot: Bot, message_id: int, game: Game):
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        # 'Message is not modified' is expected if no visual change occurs
-        if "message is not modified" not in str(e).lower():
-            logger.warning(f"Failed to edit message {message_id} in chat {chat_id}: {e}")
+        if "message is not modified" in str(e).lower():
+            # IMPROVEMENT: Log known exception at DEBUG level
+            logger.debug(f"Message {message_id} not modified.")
+            return
+            
+        logger.warning(f"Failed to edit message {message_id} in chat {chat_id}: {e}")
 
 async def main():
     """Main entry point for the bot."""
-    # Ensure the BOT_TOKEN is set before proceeding
     if not BOT_TOKEN:
          raise SystemExit("BOT_TOKEN is not configured.")
 
