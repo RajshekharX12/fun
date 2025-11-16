@@ -605,4 +605,123 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.edit_message_text(
             "OpenVPN config sent above.\n\n" + main_menu_text(user),
-            r
+            reply_markup=main_menu_keyboard(user),
+        )
+        save_data(data)
+        return
+
+    # Help menus
+    if cd == "help_android":
+        await query.edit_message_text(
+            android_help_text(),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Back", callback_data="menu_main")]]
+            ),
+        )
+        return
+
+    if cd == "help_ios":
+        await query.edit_message_text(
+            ios_help_text(),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Back", callback_data="menu_main")]]
+            ),
+        )
+        return
+
+    # FAQ
+    if cd == "menu_faq":
+        await query.edit_message_text(
+            faq_intro_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    if cd == "faq_overview":
+        await query.edit_message_text(
+            faq_intro_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    if cd == "faq_legal":
+        await query.edit_message_text(
+            faq_legal_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    if cd == "faq_privacy":
+        await query.edit_message_text(
+            faq_privacy_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    if cd == "faq_speed":
+        await query.edit_message_text(
+            faq_speed_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    if cd == "faq_troubleshoot":
+        await query.edit_message_text(
+            faq_troubleshoot_text(),
+            reply_markup=faq_keyboard(),
+        )
+        return
+
+    # Account
+    if cd == "menu_account":
+        text = (
+            "Account info:\n\n"
+            f"Configs generated: {user.get('profiles_created', 0)}\n"
+            f"Protocol: {user.get('protocol', DEFAULT_PROTOCOL)}\n"
+            f"Country: {get_country_label(user.get('country', DEFAULT_COUNTRY))}\n"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=account_keyboard(),
+        )
+        save_data(data)
+        return
+
+    if cd == "account_delete":
+        uid = str(query.from_user.id)
+        if uid in data:
+            del data[uid]
+            save_data(data)
+        await query.edit_message_text(
+            "Your bot data has been deleted. You can use /start again anytime."
+        )
+        return
+
+    # Language toggle
+    if cd == "toggle_lang":
+        current = user.get("lang", "en")
+        user["lang"] = "hi" if current == "en" else "en"
+        save_data(data)
+        await query.edit_message_text(
+            main_menu_text(user),
+            reply_markup=main_menu_keyboard(user),
+        )
+        return
+
+
+# ========================
+# MAIN
+# ========================
+
+def main() -> None:
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
