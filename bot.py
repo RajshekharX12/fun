@@ -1,471 +1,608 @@
-# bot.py
-# Unbeatable Tic-Tac-Toe Telegram bot using aiogram 3.x + Minimax.
-# - Inline keyboard 3x3 board
-# - Human = X, Bot = O (optimal play, cannot be beaten)
-# - Works in private chats; safe in groups (ignores others' taps)
-# - Game state is held in memory (in the Dispatcher's context).
-# - Attitude and clean asynchronous flow implemented.
+#!/usr/bin/env python3
+"""
+Combined WireGuard + OpenVPN VPN helper bot.
 
-import asyncio
-import os
-import time
+NOTE:
+- This bot does NOT run a VPN server.
+- It only generates client config templates and (for WireGuard) a server-side peer snippet.
+- You must configure real servers and replace placeholders with your real data.
+"""
+
+import json
 import logging
-from typing import List, Optional, Tuple, Dict, Any
+from io import BytesIO
+from pathlib import Path
 
-# --- Env loader setup ---
-from dotenv import load_dotenv
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Load environment variables from a .env file
-load_dotenv()
-# ------------------------
+# ========================
+# BASIC CONFIG
+# ========================
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+DATA_FILE = Path("vpn_users.json")
+
+# Protocol / country choices
+PROTOCOL_WG = "wireguard"
+PROTOCOL_OVPN = "openvpn"
+
+# Supported countries
+VPN_PROFILES = {
+    "nl": {
+        "name": "Netherlands",
+        "wg_endpoint": "nl1.yourvpn.example.com:51820",
+        "wg_server_public_key": "REPLACE_WITH_NL_WG_SERVER_PUB",
+        "wg_subnet_prefix": "10.8.0.",  # last octet per-user
+        "ovpn_remote": "nl1.yourvpn.example.com 1194",
+    },
+    "de": {
+        "name": "Germany",
+        "wg_endpoint": "de1.yourvpn.example.com:51820",
+        "wg_server_public_key": "REPLACE_WITH_DE_WG_SERVER_PUB",
+        "wg_subnet_prefix": "10.9.0.",
+        "ovpn_remote": "de1.yourvpn.example.com 1194",
+    },
+    "us": {
+        "name": "United States",
+        "wg_endpoint": "us1.yourvpn.example.com:51820",
+        "wg_server_public_key": "REPLACE_WITH_US_WG_SERVER_PUB",
+        "wg_subnet_prefix": "10.10.0.",
+        "ovpn_remote": "us1.yourvpn.example.com 1194",
+    },
+    "sg": {
+        "name": "Singapore",
+        "wg_endpoint": "sg1.yourvpn.example.com:51820",
+        "wg_server_public_key": "REPLACE_WITH_SG_WG_SERVER_PUB",
+        "wg_subnet_prefix": "10.11.0.",
+        "ovpn_remote": "sg1.yourvpn.example.com 1194",
+    },
+}
+
+DEFAULT_COUNTRY = "nl"
+DEFAULT_PROTOCOL = PROTOCOL_WG
+
+WG_DNS = "1.1.1.1"
+WG_ALLOWED_IPS = "0.0.0.0/0, ::/0"
+
+# ========================
+# LOGGING
+# ========================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise SystemExit("Please set BOT_TOKEN env var (or use a .env loader).")
 
-# -------------------------------------------------------------------
-# TYPE DEFINITIONS & IN-MEMORY STATE
-# -------------------------------------------------------------------
+# ========================
+# PERSISTENCE
+# ========================
 
-# Game State structure:
-# (gid, chat_id, message_id, user_id, username, board, status)
-Game = Tuple[str, int, int, int, str, str, str]
-
-# The memory store for active games: { message_id: Game }
-GAME_STATE_KEY = "active_games"
-
-# -------------------------------------------------------------------
-# Game logic (Minimax)
-# -------------------------------------------------------------------
-HUMAN = "X"
-BOT = "O"
-EMPTY = " "
-
-def lines() -> List[Tuple[int, int, int]]:
-    """Returns all winning lines (rows, columns, diagonals)."""
-    return [
-        (0,1,2), (3,4,5), (6,7,8),  # rows
-        (0,3,6), (1,4,7), (2,5,8),  # cols
-        (0,4,8), (2,4,6)            # diags
-    ]
-
-def check_winner(board: str) -> Optional[str]:
-    """Checks if there is a winner and returns 'X' or 'O', or None."""
-    for a,b,c in lines():
-        if board[a] != EMPTY and board[a] == board[b] == board[c]:
-            return board[a]
-    return None
-
-def empty_cells(board: str) -> List[int]:
-    """Returns a list of indices for empty cells."""
-    return [i for i, ch in enumerate(board) if ch == EMPTY]
-
-def is_draw(board: str) -> bool:
-    """Checks if the game is a draw."""
-    return (check_winner(board) is None) and (EMPTY not in board)
-
-def minimax(board: str, is_max: bool, depth: int = 0) -> int:
-    """The Minimax algorithm to determine the optimal score."""
-    w = check_winner(board)
-    if w == BOT:   # Bot (Maximizer) wins
-        return 10 - depth
-    if w == HUMAN: # Human (Minimizer) wins
-        return depth - 10
-    if EMPTY not in board:
-        return 0 # Draw
-
-    if is_max:
-        best = -10**9
-        for i in empty_cells(board):
-            newb = board[:i] + BOT + board[i+1:]
-            best = max(best, minimax(newb, False, depth + 1))
-        return best
-    else:
-        best = 10**9
-        for i in empty_cells(board):
-            newb = board[:i] + HUMAN + board[i+1:]
-            best = min(best, minimax(newb, True, depth + 1))
-        return best
-
-def best_move(board: str) -> int:
-    """Finds the optimal move index for the BOT."""
-    best_score = -10**9
-    best_idx = -1
-    
-    # Prioritize center, then corners, then sides for faster Minimax
-    ordered_cells = [i for i in [4, 0, 2, 6, 8, 1, 3, 5, 7] if board[i] == EMPTY]
-    
-    for i in ordered_cells:
-        newb = board[:i] + BOT + board[i+1:]
-        score = minimax(newb, False, 0) # False: next is min player (Human)
-        
-        if score > best_score:
-            best_score = score
-            best_idx = i
-            
-    if best_idx == -1:
-        # Should not be reached in a non-finished game
-        return empty_cells(board)[0]
-    
-    return best_idx
-
-def resolve_status(board: str) -> str:
-    """Determines the current game status."""
-    w = check_winner(board)
-    if w == HUMAN:
-        return "XWIN"
-    if w == BOT:
-        return "OWIN"
-    if is_draw(board):
-        return "DRAW"
-    return "PLAY"
-
-# -------------------------------------------------------------------
-# UI helpers & Attitude
-# -------------------------------------------------------------------
-def cell_emoji(ch: str) -> str:
-    """Converts internal char ('X', 'O', ' ') to emoji."""
-    return "❌" if ch == "X" else ("⭕️" if ch == "O" else "•")
-
-def is_human_turn(board: str) -> bool:
-    """Checks if it's the Human's (X) turn."""
-    x_count = board.count(HUMAN)
-    o_count = board.count(BOT)
-    return x_count == o_count # X always starts, so counts should be equal
-
-def attitude_message(status: str, username: str) -> str:
-    """Generates an attitude-filled message based on the game's final status."""
-    user_name = f"@{username}" if username else "human"
-    
-    if status == "DRAW":
-        return f"🖕 | **{user_name}**, what kind of jerk are you? You can't even beat me... I'm perfect, and you're just... mediocre."
-    elif status == "OWIN":
-        return f"👑 | Hah! **{user_name}**, you really thought you could win? I calculate all possibilities. Your total defeat was inevitable. Bow down."
-    elif status == "XWIN":
-        return f"🤯 | IMPOSSIBLE! **{user_name}**, this must be a glitch in the Matrix! The universe is broken! I DEMAND A RECOUNT!"
-    else: 
-        return "Game is over, stop distracting me with your silly feelings."
+def load_data() -> dict:
+    if DATA_FILE.exists():
+        try:
+            with DATA_FILE.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to load data file: %s", e)
+            return {}
+    return {}
 
 
-def render_text(board: str, status: str, username: Optional[str] = None) -> str:
-    """Renders the game board and status message."""
-    
+def save_data(data: dict) -> None:
+    try:
+        with DATA_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error("Failed to save data file: %s", e)
+
+
+def get_user_record(data: dict, user_id: int) -> dict:
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {
+            "profiles_created": 0,
+            "lang": "en",
+            "protocol": DEFAULT_PROTOCOL,
+            "country": DEFAULT_COUNTRY,
+        }
+    return data[uid]
+
+
+# ========================
+# CONFIG GENERATION
+# ========================
+
+def get_user_ip_octet(user_id: int) -> int:
+    # deterministic but bounded 10-230
+    return (user_id % 221) + 10
+
+
+def generate_wireguard_client_config(user_id: int, country_code: str, platform: str) -> str:
+    profile = VPN_PROFILES[country_code]
+    octet = get_user_ip_octet(user_id)
+    client_ip = f"{profile['wg_subnet_prefix']}{octet}/32"
+
+    text = []
+    text.append("WireGuard client config template")
+    text.append(f"Country: {profile['name']}")
+    text.append(f"Platform: {platform}")
+    text.append("")
+    text.append("IMPORTANT:")
+    text.append("- Replace all REPLACE_WITH_... fields with your real keys.")
+    text.append("- Add the server-side [Peer] snippet on your VPN server.")
+    text.append("")
+    text.append("[Interface]")
+    text.append("PrivateKey = REPLACE_WITH_CLIENT_PRIVATE_KEY")
+    text.append(f"Address = {client_ip}")
+    text.append(f"DNS = {WG_DNS}")
+    text.append("")
+    text.append("[Peer]")
+    text.append(f"PublicKey = {profile['wg_server_public_key']}")
+    text.append("PresharedKey = REPLACE_WITH_OPTIONAL_PRESHARED_KEY")
+    text.append(f"AllowedIPs = {WG_ALLOWED_IPS}")
+    text.append(f"Endpoint = {profile['wg_endpoint']}")
+    text.append("PersistentKeepalive = 25")
+    text.append("")
+    text.append("Server-side snippet (add to wg0.conf):")
+    text.append("[Peer]")
+    text.append("PublicKey = REPLACE_WITH_CLIENT_PUBLIC_KEY")
+    text.append(f"AllowedIPs = {client_ip}")
+    text.append("# Restart your WireGuard interface after adding this peer.")
+    return "\n".join(text)
+
+
+def generate_openvpn_client_config(user_id: int, country_code: str, platform: str) -> str:
+    profile = VPN_PROFILES[country_code]
+    text = []
+    text.append("OpenVPN client config template")
+    text.append(f"Country: {profile['name']}")
+    text.append(f"Platform: {platform}")
+    text.append("")
+    text.append("IMPORTANT:")
+    text.append("- Replace all certificate/key blocks with your real values.")
+    text.append("- Match cipher/auth with your server configuration.")
+    text.append("")
+    text.append("client")
+    text.append("dev tun")
+    text.append("proto udp")
+    text.append(f"remote {profile['ovpn_remote']}")
+    text.append("resolv-retry infinite")
+    text.append("nobind")
+    text.append("persist-key")
+    text.append("persist-tun")
+    text.append("remote-cert-tls server")
+    text.append("cipher AES-256-CBC")
+    text.append("auth SHA256")
+    text.append("verb 3")
+    text.append("")
+    text.append("<ca>")
+    text.append("# Paste your CA certificate here")
+    text.append("</ca>")
+    text.append("")
+    text.append("<cert>")
+    text.append("# Paste your client certificate here")
+    text.append("</cert>")
+    text.append("")
+    text.append("<key>")
+    text.append("# Paste your client private key here")
+    text.append("</key>")
+    text.append("")
+    text.append("# Optional tls-auth key")
+    text.append("<tls-auth>")
+    text.append("# Paste your tls-auth key here")
+    text.append("</tls-auth>")
+    text.append("key-direction 1")
+    return "\n".join(text)
+
+
+def build_config_file_bytes(config_text: str, filename: str) -> BytesIO:
+    bio = BytesIO(config_text.encode("utf-8"))
+    bio.name = filename
+    return bio
+
+
+# ========================
+# TEXT BUILDERS
+# ========================
+
+def get_country_label(code: str) -> str:
+    profile = VPN_PROFILES.get(code)
+    if not profile:
+        return "Unknown"
+    flag = {
+        "nl": "🇳🇱",
+        "de": "🇩🇪",
+        "us": "🇺🇸",
+        "sg": "🇸🇬",
+    }.get(code, "🌍")
+    return f"{flag} {profile['name']}"
+
+
+def main_menu_text(user: dict) -> str:
+    protocol = user.get("protocol", DEFAULT_PROTOCOL)
+    country = user.get("country", DEFAULT_COUNTRY)
+    proto_label = "WireGuard" if protocol == PROTOCOL_WG else "OpenVPN"
+    return (
+        "VPN Helper Bot\n"
+        "--------------------\n"
+        "This bot generates templates for VPN configs.\n"
+        "You can import them into real VPN apps on Android or iOS.\n\n"
+        f"Current protocol: {proto_label}\n"
+        f"Current country: {get_country_label(country)}\n\n"
+        "Use the buttons below to choose protocol/country and get configs.\n"
+        "Remember to replace all placeholders with your real keys and certificates."
+    )
+
+
+def android_help_text() -> str:
+    return (
+        "Android setup:\n\n"
+        "WireGuard:\n"
+        "1. Install the official WireGuard app from Google Play.\n"
+        "2. Import the .conf file generated by this bot.\n"
+        "3. Make sure you filled in real keys and server details.\n"
+        "4. Toggle the tunnel ON.\n\n"
+        "OpenVPN:\n"
+        "1. Install OpenVPN for Android or OpenVPN Connect.\n"
+        "2. Import the .ovpn file from this bot.\n"
+        "3. Add your certificates/keys where required.\n"
+        "4. Connect."
+    )
+
+
+def ios_help_text() -> str:
+    return (
+        "iPhone / iOS setup:\n\n"
+        "WireGuard:\n"
+        "1. Install WireGuard from the App Store.\n"
+        "2. Share the .conf file to WireGuard (Open in WireGuard).\n"
+        "3. Allow VPN permission and enable the tunnel.\n\n"
+        "OpenVPN:\n"
+        "1. Install OpenVPN Connect.\n"
+        "2. Send the .ovpn file to your iPhone.\n"
+        "3. Open with OpenVPN and import.\n"
+        "4. Provide certs/keys if needed, then connect."
+    )
+
+
+def faq_intro_text() -> str:
+    return (
+        "VPN FAQ:\n\n"
+        "• This bot only generates config templates (WireGuard and OpenVPN).\n"
+        "• You must run and configure your own VPN servers.\n"
+        "• Always follow local laws and your provider's terms.\n"
+        "• Use VPNs for privacy, security on public Wi-Fi, and neutral browsing."
+    )
+
+
+def faq_legal_text() -> str:
+    return (
+        "Legal and responsibility:\n\n"
+        "• VPN usage is legal in many countries, restricted or banned in others.\n"
+        "• You are fully responsible for how you use VPN configs.\n"
+        "• Do not use VPN for crime or harm.\n"
+        "• This bot is for educational and personal privacy use only."
+    )
+
+
+def faq_privacy_text() -> str:
+    return (
+        "Privacy and data:\n\n"
+        "• This bot stores only minimal data: your Telegram ID, protocol/country\n"
+        "  choice, language preference, and count of generated configs.\n"
+        "• It does not see your traffic after you connect to VPN.\n"
+        "• Real logging depends on your VPN server configuration, not this bot.\n"
+        "• You can wipe your record with 'Delete my data'."
+    )
+
+
+def faq_speed_text() -> str:
+    return (
+        "Speed and latency:\n\n"
+        "• Speed depends on distance to server, server hardware, and your ISP.\n"
+        "• Netherlands, Germany, United States, Singapore usually have good connectivity.\n"
+        "• Try different locations if one is slow.\n"
+        "• Avoid overloading the same VPS with heavy tasks and VPN together."
+    )
+
+
+def faq_troubleshoot_text() -> str:
+    return (
+        "Troubleshooting:\n\n"
+        "WireGuard:\n"
+        "• If tunnel will not connect, check keys, endpoint, and firewall.\n"
+        "• Make sure server has a [Peer] entry for your client.\n\n"
+        "OpenVPN:\n"
+        "• Check that cipher/auth in client matches server.\n"
+        "• Ensure correct certificates and keys.\n"
+        "• Use logs (verb 3 or higher) to see where it fails."
+    )
+
+
+# ========================
+# KEYBOARDS
+# ========================
+
+def main_menu_keyboard(user: dict) -> InlineKeyboardMarkup:
+    protocol = user.get("protocol", DEFAULT_PROTOCOL)
+    country = user.get("country", DEFAULT_COUNTRY)
+    proto_label = "WireGuard" if protocol == PROTOCOL_WG else "OpenVPN"
+    lang = user.get("lang", "en")
+    lang_label = "English" if lang == "en" else "Hindi"
+
     rows = [
-        " ".join(cell_emoji(board[i]) for i in range(0,3)),
-        " ".join(cell_emoji(board[i]) for i in range(3,6)),
-        " ".join(cell_emoji(board[i]) for i in range(6,9)),
+        [
+            InlineKeyboardButton("Get VPN Config", callback_data="get_config"),
+        ],
+        [
+            InlineKeyboardButton(f"Protocol: {proto_label}", callback_data="choose_protocol"),
+            InlineKeyboardButton(get_country_label(country), callback_data="choose_country"),
+        ],
+        [
+            InlineKeyboardButton("Android help", callback_data="help_android"),
+            InlineKeyboardButton("iPhone help", callback_data="help_ios"),
+        ],
+        [
+            InlineKeyboardButton("FAQ", callback_data="menu_faq"),
+            InlineKeyboardButton("My account", callback_data="menu_account"),
+        ],
+        [
+            InlineKeyboardButton("Test IP", url="https://ipleak.net"),
+            InlineKeyboardButton("DNS leak test", url="https://dnsleaktest.com"),
+        ],
+        [
+            InlineKeyboardButton(f"Language: {lang_label}", callback_data="toggle_lang"),
+        ],
     ]
-    
-    heading = "<b>Tic-Tac-Toe</b> (You: ❌  |  Bot: ⭕️)"
-    board_str = "\n\n<code>" + "\n".join(rows) + "</code>"
-    
-    if status == "PLAY":
-        is_human = is_human_turn(board)
-        if board.count(EMPTY) == 9:
-            status_line = "Your move. Try not to embarrass yourself."
-        elif is_human:
-             status_line = "Your turn. I'm waiting. Tick-tock."
-        else:
-             status_line = "Bot is calculating your inevitable demise..." 
-    else:
-        status_line = attitude_message(status, username)
-        
-    return heading + "\n\n" + status_line + board_str
+    return InlineKeyboardMarkup(rows)
 
-def board_keyboard(gid: str, board: str, status: str) -> InlineKeyboardMarkup:
-    """Generates the inline keyboard for the board."""
-    kb_rows = []
-    can_play = status == "PLAY" and is_human_turn(board)
-    
-    for r in range(3):
-        row = []
-        for c in range(3):
-            idx = r * 3 + c
-            ch = board[idx]
-            text = cell_emoji(ch)
-            
-            if can_play and ch == EMPTY:
-                row.append(InlineKeyboardButton(text=text, callback_data=f"mv:{gid}:{idx}"))
-            else:
-                row.append(InlineKeyboardButton(text=text, callback_data=f"noop:{gid}"))
-        kb_rows.append(row)
 
-    bottom = []
-    if status == "PLAY" and board == EMPTY * 9:
-        bottom.append(InlineKeyboardButton(text="🤖 Bot starts (I am the master)", callback_data=f"botstart:{gid}"))
-        
-    bottom.append(InlineKeyboardButton(text="⚔️ New game (Same result, probably)", callback_data="new"))
-    kb_rows.append(bottom)
-    
-    return InlineKeyboardMarkup(inline_keyboard=kb_rows)
+def protocol_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("WireGuard", callback_data="set_proto_wg"),
+            InlineKeyboardButton("OpenVPN", callback_data="set_proto_ovpn"),
+        ],
+        [
+            InlineKeyboardButton("Back", callback_data="menu_main"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-# -------------------------------------------------------------------
-# Bot wiring & Handlers
-# -------------------------------------------------------------------
-router = Router()
 
-def get_game(message_id: int, workflow_data: Dict[str, Any]) -> Optional[Game]:
-    """Retrieves a game state from memory."""
-    return workflow_data.get(GAME_STATE_KEY, {}).get(message_id)
-
-def set_game(game: Game, workflow_data: Dict[str, Any]):
-    """Stores or updates a game state in memory."""
-    gid, chat_id, message_id, user_id, username, board, status = game
-    if GAME_STATE_KEY not in workflow_data:
-        workflow_data[GAME_STATE_KEY] = {}
-    
-    workflow_data[GAME_STATE_KEY][message_id] = game
-
-def delete_game(message_id: int, workflow_data: Dict[str, Any]):
-    """Deletes a game state from memory."""
-    if GAME_STATE_KEY in workflow_data and message_id in workflow_data[GAME_STATE_KEY]:
-        del workflow_data[GAME_STATE_KEY][message_id]
-        logger.info(f"Deleted game state for message {message_id}")
-
-@router.message(CommandStart())
-async def on_start(m: Message):
-    """Handles the /start command with the new bot bio/attitude."""
-    username = m.from_user.username or m.from_user.first_name
-    await m.answer(
-        f"Hi, **{username}**. I’m an <b>unbeatable</b> Tic-Tac-Toe bot.\n"
-        "• You are ❌, I am ⭕️\n"
-        "• I play **perfectly** (Minimax) — so don't strain your tiny brain. You can only draw if you also play perfectly.\n\n"
-        "Tap <b>New game</b> to start your inevitable loss.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎮 New game", callback_data="new")]
-        ],),
-        parse_mode=ParseMode.HTML
-    )
-
-# FIX: Added workflow_data argument
-@router.message(Command("newgame"))
-async def on_newgame_cmd(m: Message, bot: Bot, workflow_data: Dict[str, Any]):
-    """Handles the /newgame command."""
-    username = m.from_user.username or m.from_user.first_name
-    await start_new_game(m.chat.id, m.from_user.id, username, bot, workflow_data)
-
-# FIX: Added workflow_data argument
-@router.callback_query(F.data == "new")
-async def on_new(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
-    """Handles the 'New game' inline button click."""
-    await cq.answer()
-    username = cq.from_user.username or cq.from_user.first_name
-    
-    # Optional: Delete the old game state if it exists
-    if cq.message and cq.message.message_id in workflow_data.get(GAME_STATE_KEY, {}):
-        delete_game(cq.message.message_id, workflow_data)
-        
-    await start_new_game(cq.message.chat.id, cq.from_user.id, username, bot, workflow_data)
-    
-async def start_new_game(chat_id: int, user_id: int, username: str, bot: Bot, workflow_data: Dict[str, Any]):
-    """Starts a new game and sends the initial message."""
-    gid = hex(int(time.time() * 1000))[2:]
-    board = EMPTY * 9
-    status = "PLAY"
-
-    txt = render_text(board, status, username)
-    kb = board_keyboard(gid, board, status)
-    
-    try:
-        msg = await bot.send_message(chat_id, txt, reply_markup=kb, parse_mode=ParseMode.HTML)
-        
-        # Store the game state in memory
-        game = (gid, chat_id, msg.message_id, user_id, username, board, status)
-        set_game(game, workflow_data)
-        
-        logger.info(f"New game {gid} started. Stored with message_id {msg.message_id}")
-    except Exception as e:
-        logger.error(f"Failed to send new game message to chat {chat_id}: {e}")
-
-@router.callback_query(F.data.startswith("botstart:"))
-async def on_bot_start(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
-    """Handles the 'Bot starts' button click (initial move O)."""
-    await cq.answer()
-    # _, gid = cq.data.split(":") # gid is unused, can be removed
-    
-    if not cq.message: return
-
-    game = get_game(cq.message.message_id, workflow_data)
-    
-    # Validate click is from the correct user and game exists
-    if not game or cq.from_user.id != game[3]:
-        if game and cq.from_user.id != game[3]:
-            await cq.answer(f"Hush, {cq.from_user.first_name}. This is not your game! Go start a /newgame.", show_alert=True)
-        return
-        
-    gid, chat_id, message_id, user_id, username, board, status = game
-    
-    # Must be the very start of the game
-    if board != EMPTY * 9 or status != "PLAY":
-        return
-        
-    # --- Bot move (O) ---
-    idx = best_move(board)
-    board = board[:idx] + BOT + board[idx+1:]
-    
-    status = resolve_status(board)
-    
-    # Update game state in memory
-    game_after_bot = (gid, chat_id, message_id, user_id, username, board, status)
-    set_game(game_after_bot, workflow_data)
-    
-    # Pass the updated game state
-    await edit_board(bot, message_id, game_after_bot) 
-
-@router.callback_query(F.data.startswith("mv:"))
-async def on_move(cq: CallbackQuery, bot: Bot, workflow_data: Dict[str, Any]):
-    """Handles a human's move and schedules the bot's counter-move."""
-    await cq.answer()
-    _, gid, sidx = cq.data.split(":")
-    idx = int(sidx)
-    
-    if not cq.message: return
-
-    # Retrieve and validate game state
-    game = get_game(cq.message.message_id, workflow_data)
-    if not game or cq.from_user.id != game[3]:
-        if game and cq.from_user.id != game[3]:
-            await cq.answer(f"Hush, {cq.from_user.first_name}. This is not your game! Go start a /newgame.", show_alert=True)
-        return
-
-    gid, chat_id, message_id, user_id, username, board, status = game
-    
-    # Validate: still playing, human's turn, cell empty
-    if status != "PLAY" or not is_human_turn(board) or board[idx] != EMPTY:
-        return
-    
-    # --- 1. Human move (X) and initial status check ---
-    board_after_human = board[:idx] + HUMAN + board[idx+1:]
-    status_after_human = resolve_status(board_after_human)
-    
-    # Update game state in memory immediately with human's move and new status
-    game_after_human = (gid, chat_id, message_id, user_id, username, board_after_human, status_after_human)
-    set_game(game_after_human, workflow_data)
-    
-    if status_after_human != "PLAY":
-        # Game over after human move (Win or Draw)
-        await edit_board(bot, message_id, game_after_human)
-        delete_game(message_id, workflow_data)
-        return
-
-    # --- 2. Update board to 'Bot is thinking...' ---
-    await edit_board(bot, message_id, game_after_human)
-
-    # --- 3. Schedule Bot move (O) as a separate task ---
-    asyncio.create_task(
-        bot_move_task(bot, message_id, board_after_human, workflow_data)
-    )
-
-async def bot_move_task(bot: Bot, message_id: int, board_before_bot: str, workflow_data: Dict[str, Any]):
-    """Calculates and executes the bot's move."""
-    try:
-        # Give a small artificial delay for the 'thinking' effect
-        await asyncio.sleep(0.5) 
-
-        # Retrieve the latest game state
-        game = get_game(message_id, workflow_data)
-        if not game:
-            logger.warning(f"Game {message_id} vanished before bot could move.")
-            return
-
-        gid, chat_id, message_id, user_id, username, current_board, status = game
-
-        # CRITICAL: Only proceed if the board hasn't changed since the human move
-        # This protects against double-taps or concurrency issues
-        if current_board != board_before_bot:
-             logger.warning(f"Bot move skipped: Board state changed unexpectedly for game {gid}")
-             return
-
-        # Recalculate best move
-        bot_idx = best_move(current_board)
-        board_after_bot = current_board[:bot_idx] + BOT + current_board[bot_idx+1:]
-        status_after_bot = resolve_status(board_after_bot)
-        
-        # Update game state in memory
-        game_after_bot = (gid, chat_id, message_id, user_id, username, board_after_bot, status_after_bot)
-        set_game(game_after_bot, workflow_data)
-        
-        # Edit message to show final board state
-        await edit_board(bot, message_id, game_after_bot)
-
-        if status_after_bot != "PLAY":
-            delete_game(message_id, workflow_data)
-
-    except Exception as e:
-        logger.error(f"Bot move task failed for game {message_id}: {e}")
-
-# FIX: Added workflow_data argument for correct dependency injection
-@router.callback_query(F.data.startswith("noop:"))
-async def on_noop(cq: CallbackQuery, workflow_data: Dict[str, Any]):
-    """Handles clicks on non-action buttons (taken cells, bot's turn, etc.)."""
-    
-    if not cq.message: return
-    # Retrieve game state using the injected workflow_data
-    game = get_game(cq.message.message_id, workflow_data)
-    
-    if game and cq.from_user.id != game[3]:
-        # User who did not start the game: show an alert
-        player_name = cq.from_user.first_name
-        await cq.answer(f"Hush, {player_name}. This is not your game! Go start a /newgame.", show_alert=True)
-    else:
-        # Player clicked a non-actionable button: answer silently
-        await cq.answer()
-    
-# -------------------------------------------------------------------
-# Message Management
-# -------------------------------------------------------------------
-async def edit_board(bot: Bot, message_id: int, game: Game):
-    """Edits the board message with the current game state."""
-    gid, chat_id, message_id, user_id, username, board, status = game
-    
-    new_text = render_text(board, status, username)
-    new_keyboard = board_keyboard(gid, board, status)
-    
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=new_text,
-            reply_markup=new_keyboard,
-            parse_mode=ParseMode.HTML
+def country_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for code in VPN_PROFILES.keys():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    get_country_label(code),
+                    callback_data=f"set_country_{code}",
+                )
+            ]
         )
-    except Exception as e:
-        if "message is not modified" in str(e).lower():
-            # IMPROVEMENT: Log known exception at DEBUG level
-            logger.debug(f"Message {message_id} not modified.")
-            return
-            
-        logger.warning(f"Failed to edit message {message_id} in chat {chat_id}: {e}")
+    rows.append([InlineKeyboardButton("Back", callback_data="menu_main")])
+    return InlineKeyboardMarkup(rows)
 
-async def main():
-    """Main entry point for the bot."""
-    if not BOT_TOKEN:
-         raise SystemExit("BOT_TOKEN is not configured.")
 
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    dp.include_router(router)
-    
-    # Initialize the in-memory game state store
-    dp.workflow_data[GAME_STATE_KEY] = {}
-    
-    logger.info("Starting bot polling...")
-    await dp.start_polling(bot)
+def faq_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Overview", callback_data="faq_overview")],
+        [
+            InlineKeyboardButton("Legal", callback_data="faq_legal"),
+            InlineKeyboardButton("Privacy", callback_data="faq_privacy"),
+        ],
+        [
+            InlineKeyboardButton("Speed", callback_data="faq_speed"),
+            InlineKeyboardButton("Troubleshooting", callback_data="faq_troubleshoot"),
+        ],
+        [InlineKeyboardButton("Back", callback_data="menu_main")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped by user interrupt.")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred in main: {e}")
+
+def account_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("Delete my data", callback_data="account_delete")],
+        [InlineKeyboardButton("Back", callback_data="menu_main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+# ========================#
+# HANDLERS
+# ========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = load_data()
+    user = get_user_record(data, update.effective_user.id)
+    save_data(data)
+
+    text = main_menu_text(user)
+    keyboard = main_menu_keyboard(user)
+
+    if update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(text, reply_markup=keyboard)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await start(update, context)
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = load_data()
+    user = get_user_record(data, query.from_user.id)
+    cd = query.data
+
+    await query.answer()
+
+    # Main menu
+    if cd == "menu_main":
+        save_data(data)
+        await query.edit_message_text(
+            main_menu_text(user),
+            reply_markup=main_menu_keyboard(user),
+        )
+        return
+
+    # Protocol and country selection
+    if cd == "choose_protocol":
+        await query.edit_message_text(
+            "Choose VPN protocol:",
+            reply_markup=protocol_keyboard(),
+        )
+        return
+
+    if cd == "choose_country":
+        await query.edit_message_text(
+            "Choose VPN country:",
+            reply_markup=country_keyboard(),
+        )
+        return
+
+    if cd == "set_proto_wg":
+        user["protocol"] = PROTOCOL_WG
+        save_data(data)
+        await query.edit_message_text(
+            "Protocol set to WireGuard.\n\n" + main_menu_text(user),
+            reply_markup=main_menu_keyboard(user),
+        )
+        return
+
+    if cd == "set_proto_ovpn":
+        user["protocol"] = PROTOCOL_OVPN
+        save_data(data)
+        await query.edit_message_text(
+            "Protocol set to OpenVPN.\n\n" + main_menu_text(user),
+            reply_markup=main_menu_keyboard(user),
+        )
+        return
+
+    if cd.startswith("set_country_"):
+        code = cd.split("_", maxsplit=2)[2]
+        if code in VPN_PROFILES:
+            user["country"] = code
+            save_data(data)
+            await query.edit_message_text(
+                f"Country set to {get_country_label(code)}.\n\n" + main_menu_text(user),
+                reply_markup=main_menu_keyboard(user),
+            )
+        else:
+            await query.edit_message_text(
+                "Unknown country code.\n\n" + main_menu_text(user),
+                reply_markup=main_menu_keyboard(user),
+            )
+        return
+
+    # Get config flow
+    if cd == "get_config":
+        proto = user.get("protocol", DEFAULT_PROTOCOL)
+        country = user.get("country", DEFAULT_COUNTRY)
+        user["profiles_created"] += 1
+        save_data(data)
+
+        if proto == PROTOCOL_WG:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Android", callback_data="wg_android"),
+                        InlineKeyboardButton("iOS", callback_data="wg_ios"),
+                    ],
+                    [InlineKeyboardButton("Back", callback_data="menu_main")],
+                ]
+            )
+            await query.edit_message_text(
+                f"WireGuard config for {get_country_label(country)}.\n"
+                "Choose your platform:",
+                reply_markup=keyboard,
+            )
+        else:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Android", callback_data="ovpn_android"),
+                        InlineKeyboardButton("iOS", callback_data="ovpn_ios"),
+                        InlineKeyboardButton("Desktop", callback_data="ovpn_desktop"),
+                    ],
+                    [InlineKeyboardButton("Back", callback_data="menu_main")],
+                ]
+            )
+            await query.edit_message_text(
+                f"OpenVPN config for {get_country_label(country)}.\n"
+                "Choose your platform:",
+                reply_markup=keyboard,
+            )
+        return
+
+    # WireGuard platform-specific
+    if cd in ("wg_android", "wg_ios"):
+        country = user.get("country", DEFAULT_COUNTRY)
+        platform = "android" if cd == "wg_android" else "ios"
+        cfg_text = generate_wireguard_client_config(query.from_user.id, country, platform)
+
+        await query.message.reply_text(
+            f"WireGuard config template ({get_country_label(country)} - {platform}):\n\n"
+            f"{cfg_text}"
+        )
+
+        filename = f"{country}_wg_{platform}_{query.from_user.id}.conf"
+        cfg_file = build_config_file_bytes(cfg_text, filename)
+        await query.message.reply_document(
+            document=cfg_file,
+            filename=filename,
+            caption="Import this file into WireGuard and replace placeholders with real keys.",
+        )
+
+        await query.edit_message_text(
+            "WireGuard config sent above.\n\n" + main_menu_text(user),
+            reply_markup=main_menu_keyboard(user),
+        )
+        save_data(data)
+        return
+
+    # OpenVPN platform-specific
+    if cd in ("ovpn_android", "ovpn_ios", "ovpn_desktop"):
+        country = user.get("country", DEFAULT_COUNTRY)
+        if cd == "ovpn_android":
+            platform = "android"
+        elif cd == "ovpn_ios":
+            platform = "ios"
+        else:
+            platform = "desktop"
+
+        cfg_text = generate_openvpn_client_config(query.from_user.id, country, platform)
+
+        await query.message.reply_text(
+            f"OpenVPN config template ({get_country_label(country)} - {platform}):\n\n"
+            f"{cfg_text}"
+        )
+
+        filename = f"{country}_ovpn_{platform}_{query.from_user.id}.ovpn"
+        cfg_file = build_config_file_bytes(cfg_text, filename)
+        await query.message.reply_document(
+            document=cfg_file,
+            filename=filename,
+            caption="Import this file into OpenVPN and replace placeholders with real certs and keys.",
+        )
+
+        await query.edit_message_text(
+            "OpenVPN config sent above.\n\n" + main_menu_text(user),
+            r
