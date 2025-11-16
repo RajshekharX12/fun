@@ -1,5 +1,4 @@
 aiogram>=3.7,<3.8
 aiosqlite>=0.19
 python-dotenv>=1.0
-python-dateutil>=2.9
-deep-translator>=1.11  # optional; auto-disables if not configured
+python-telegram-bot==22.5
