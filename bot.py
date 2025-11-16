@@ -29,7 +29,7 @@ from telegram.ext import (
 # BASIC CONFIG
 # ========================
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = "7780014048:AAGuVnYTxEyfaJdHNp0-Mw29q8tKdb5B3uU"
 
 DATA_FILE = Path("vpn_users.json")
 
